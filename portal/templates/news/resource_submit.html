@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block title %}Submit Resource · AI News Portal{% endblock %}
+{% block content %}
+<section class="news-hero mb-8">
+  <p class="news-kicker mb-2 text-xs font-semibold uppercase tracking-[0.22em] text-blue-700">Resource Intake</p>
+  <h1 class="mb-2 text-3xl font-bold text-slate-900 sm:text-4xl">Submit Resource Link</h1>
+  <p class="text-base text-slate-600">The link is processed by the agent, classified, and queued for Telegram approval before public release.</p>
+</section>
+
+{% if error %}
+<div class="mb-6 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{{ error }}</div>
+{% endif %}
+{% if success %}
+<div class="mb-6 rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-700">{{ success }}</div>
+{% endif %}
+
+<section class="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+  <form method="post" class="grid gap-4">
+    {% csrf_token %}
+    <div>
+      <label class="mb-1 block text-sm font-semibold text-slate-700">Resource URL *</label>
+      <input name="resource_url" value="{{ form.resource_url }}" required placeholder="https://..." class="w-full rounded-xl border border-slate-300 px-3 py-2 text-sm outline-none transition focus:border-blue-500 focus:ring-4 focus:ring-blue-100" />
+    </div>
+    <div>
+      <label class="mb-1 block text-sm font-semibold text-slate-700">Title (optional override)</label>
+      <input name="title" value="{{ form.title }}" class="w-full rounded-xl border border-slate-300 px-3 py-2 text-sm outline-none transition focus:border-blue-500 focus:ring-4 focus:ring-blue-100" />
+    </div>
+    <div>
+      <label class="mb-1 block text-sm font-semibold text-slate-700">Description (optional override)</label>
+      <textarea name="description" rows="4" class="w-full rounded-xl border border-slate-300 px-3 py-2 text-sm outline-none transition focus:border-blue-500 focus:ring-4 focus:ring-blue-100">{{ form.description }}</textarea>
+    </div>
+    <div class="grid gap-3 sm:grid-cols-3">
+      <input name="section" value="{{ form.section }}" placeholder="Section (optional)" class="rounded-xl border border-slate-300 px-3 py-2 text-sm outline-none transition focus:border-blue-500 focus:ring-4 focus:ring-blue-100" />
+      <input name="category" value="{{ form.category }}" placeholder="Category (optional)" class="rounded-xl border border-slate-300 px-3 py-2 text-sm outline-none transition focus:border-blue-500 focus:ring-4 focus:ring-blue-100" />
+      <input name="subcategory" value="{{ form.subcategory }}" placeholder="Sub-category (optional)" class="rounded-xl border border-slate-300 px-3 py-2 text-sm outline-none transition focus:border-blue-500 focus:ring-4 focus:ring-blue-100" />
+    </div>
+    <div class="flex items-center gap-3">
+      <button class="rounded-xl bg-slate-900 px-4 py-2 text-sm font-semibold text-white transition hover:bg-slate-800" type="submit">Process & Queue Approval</button>
+      <a href="/resources/" class="rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 transition hover:border-blue-400 hover:text-blue-700">Back to Resources</a>
+    </div>
+  </form>
+</section>
+
+{% if result %}
+<section class="mt-6 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+  <h2 class="mb-3 text-xl font-bold text-slate-900">Processed Result</h2>
+  <pre class="overflow-x-auto rounded-xl bg-slate-50 p-3 text-xs text-slate-700">{{ result_pretty }}</pre>
+</section>
+{% endif %}
+{% endblock %}

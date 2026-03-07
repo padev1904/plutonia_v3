@@ -1,0 +1,13 @@
+<div id="web-results" class="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+  <h2 class="mb-3 text-sm font-semibold text-slate-800">Related from the web</h2>
+  <ul class="space-y-3 text-sm">
+    {% for row in web_results %}
+      <li class="rounded-xl border border-slate-200 bg-slate-50 p-3">
+        <a href="{{ row.url }}" target="_blank" rel="noopener" class="font-semibold text-blue-700 hover:text-blue-600">{{ row.title }}</a>
+        {% if row.content %}<p class="mt-1 text-slate-600">{{ row.content }}</p>{% endif %}
+      </li>
+    {% empty %}
+      <li class="text-slate-500">No web results available.</li>
+    {% endfor %}
+  </ul>
+</div>

@@ -1,0 +1,121 @@
+name: plutonia-ainews
+
+services:
+  portal:
+    build:
+      context: .
+      dockerfile: portal/Dockerfile
+    container_name: ainews-portal
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - portal-staticfiles:/app/staticfiles
+      - portal-logs:/app/logs
+    ports:
+      - "127.0.0.1:8010:8000"
+    command: >
+      sh -lc "python manage.py migrate &&
+              python manage.py collectstatic --noinput &&
+              python manage.py ensure_superuser &&
+              gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers 4 --timeout 120"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/healthz >/dev/null || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - ainews-net
+
+  gmail-monitor:
+    build:
+      context: .
+      dockerfile: portal/Dockerfile
+    container_name: ainews-gmail-monitor
+    expose:
+      - "8001"
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      PORTAL_API_URL: http://portal:8000/api/agent
+      OLLAMA_HOST: http://ollama:11434
+      SEARXNG_URL: http://searxng:8080
+      LLM_BACKEND: ollama
+      OPENCLAW_CONTAINER_NAME: plutonia-openclaw
+      OPENCLAW_TIMEOUT_SECONDS: "240"
+      OPENCLAW_FALLBACK_OLLAMA: "false"
+      OPENCLAW_CONFIG_PATH: /openclaw-config/openclaw.json
+      REVIEW_BEFORE_PUBLISH: "true"
+      REVIEW_OUTPUT_DIR: /review
+      REVIEW_SIGNATURE_REQUIRED: "true"
+      REVIEW_SIGNATURE_MAX_AGE_SECONDS: "300"
+      SIGN_REVIEW_AUTO_APPLY: "true"
+      REVIEW_API_BASE: "http://127.0.0.1:8001"
+      REVIEW_NEXT_NOTIFICATION_DELAY_SECONDS: "15"
+      SOURCE_REWRITE_ENABLED: "true"
+      SOURCE_REWRITE_MAX_CHARS: "12000"
+      PARALLEL_INGEST_BATCH_SIZE: "5"
+      ALLOWED_FORWARDER_EMAILS: carlos.santos@plutoanalytics.com
+      GMAIL_EXCLUDED_LABELS: ""
+      # --- Telegram bot with inline buttons (Fase 4) ---
+      TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN}"
+      TELEGRAM_CHAT_ID: "${TELEGRAM_CHAT_ID}"
+      PORTAL_PUBLIC_BASE_URL: "${PORTAL_PUBLIC_BASE_URL:-}"
+      TELEGRAM_TRIAGE_INTERVAL: "15"
+      # --- Per-task model configuration (Fase 6) ---
+      OLLAMA_MODEL_SUMMARY: "${OLLAMA_MODEL_SUMMARY:-qwen3:14b}"
+      OLLAMA_MODEL_TITLE: "${OLLAMA_MODEL_TITLE:-qwen3:14b}"
+      OLLAMA_MODEL_LINK_VALIDATION: "${OLLAMA_MODEL_LINK_VALIDATION:-qwen3:14b}"
+      # --- Link validation thresholds (Fase 2) ---
+      LINK_VALID_THRESHOLD: "${LINK_VALID_THRESHOLD:-0.75}"
+      LINK_UNCERTAIN_THRESHOLD: "${LINK_UNCERTAIN_THRESHOLD:-0.45}"
+      LINK_VALIDATION_TIMEOUT: "${LINK_VALIDATION_TIMEOUT:-60}"
+    command: ["python", "/opt/ai-news-scripts/gmail_monitor.py", "--mode", "monitor"]
+    volumes:
+      - portal-logs:/logs
+      - ./review:/review
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /home/python/.openclaw/openclaw.json:/openclaw-config/openclaw.json:ro
+    depends_on:
+      portal:
+        condition: service_healthy
+    networks:
+      - ainews-net
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: ainews-cloudflared
+    restart: unless-stopped
+    command: ["tunnel", "--no-autoupdate", "--url", "http://nginx:80"]
+    depends_on:
+      nginx:
+        condition: service_started
+    networks:
+      - ainews-net
+
+  nginx:
+    build:
+      context: ./nginx
+      dockerfile: Dockerfile
+    container_name: ainews-nginx
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8089:80"
+    volumes:
+      - portal-staticfiles:/var/www/static:ro
+    depends_on:
+      portal:
+        condition: service_started
+    networks:
+      - ainews-net
+
+networks:
+  ainews-net:
+    external: true
+    name: plutonia_default
+
+volumes:
+  portal-staticfiles:
+  portal-logs:

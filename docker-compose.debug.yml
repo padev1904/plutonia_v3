@@ -1,0 +1,11 @@
+services:
+  gmail-monitor:
+    command: ["python", "-Xfrozen_modules=off", "/opt/ai-news-scripts/gmail_monitor.py", "--mode", "monitor"]
+    environment:
+      DEBUGPY_ENABLE: "true"
+      DEBUGPY_WAIT_FOR_CLIENT: "true"
+      DEBUGPY_BREAK_ON_START: "true"
+      DEBUGPY_HOST: "0.0.0.0"
+      DEBUGPY_PORT: "5679"
+    ports:
+      - "127.0.0.1:5679:5679"

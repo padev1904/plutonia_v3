@@ -1,0 +1,41 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "ai-news: clean restart (monitor stopped)",
+      "type": "shell",
+      "command": "bash -lc './scripts/restart_clean.sh && docker compose stop gmail-monitor'",
+      "options": {
+        "cwd": "/opt/plutonia/ai-news-portal"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "ai-news: start gmail-monitor debug mode",
+      "type": "shell",
+      "command": "bash -lc 'docker compose -f docker-compose.yml -f docker-compose.debug.yml up -d --build --force-recreate gmail-monitor'",
+      "options": {
+        "cwd": "/opt/plutonia/ai-news-portal"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "ai-news: debug bootstrap (clean)",
+      "dependsOrder": "sequence",
+      "dependsOn": [
+        "ai-news: clean restart (monitor stopped)",
+        "ai-news: start gmail-monitor debug mode"
+      ],
+      "problemMatcher": []
+    },
+    {
+      "label": "ai-news: stop debug and restore normal monitor",
+      "type": "shell",
+      "command": "bash -lc 'docker compose stop gmail-monitor && docker compose up -d --force-recreate gmail-monitor'",
+      "options": {
+        "cwd": "/opt/plutonia/ai-news-portal"
+      },
+      "problemMatcher": []
+    }
+  ]
+}

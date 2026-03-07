@@ -1,0 +1,5 @@
+{% for article in page_obj.object_list %}
+  {% include "news/partials/article_card.html" with article=article %}
+{% empty %}
+  <div class="rounded-xl border border-slate-200 bg-slate-50 p-5 text-sm text-slate-500">No articles found.</div>
+{% endfor %}

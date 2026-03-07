@@ -1,0 +1,103 @@
+{% extends "base.html" %}
+{% block title %}Resources · AI News Portal{% endblock %}
+{% block content %}
+<section class="resource-shell">
+  <section class="resource-header">
+    <p class="news-kicker mb-2 text-xs font-semibold uppercase tracking-[0.22em] text-blue-700">Resource Library</p>
+    <div class="mb-2 flex flex-wrap items-center justify-between gap-3">
+      <h1 class="text-3xl font-bold text-slate-900 sm:text-4xl">Curated AI Learning Resources</h1>
+      <a href="/resources/submit/" class="rounded-xl border border-blue-200 bg-blue-50 px-3 py-2 text-sm font-semibold text-blue-700 transition hover:border-blue-300 hover:bg-blue-100">Submit Resource</a>
+    </div>
+    <p class="text-base text-slate-600">Editorially organized resources with teaser cards and full long-form detail pages.</p>
+  </section>
+
+  <section class="filter-panel mb-8 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm sm:p-5">
+    <form method="get" class="grid gap-3 md:grid-cols-2 xl:grid-cols-6 xl:items-center">
+      <input name="q" value="{{ filters.q }}" placeholder="Search resource title/description" class="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm outline-none transition focus:border-blue-500 focus:ring-4 focus:ring-blue-100" />
+      <select name="section" class="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm outline-none transition focus:border-blue-500 focus:ring-4 focus:ring-blue-100">
+        <option value="">All sections</option>
+        {% for value in sections %}
+        <option value="{{ value }}" {% if filters.section == value %}selected{% endif %}>{{ value }}</option>
+        {% endfor %}
+      </select>
+      <select name="category" class="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm outline-none transition focus:border-blue-500 focus:ring-4 focus:ring-blue-100">
+        <option value="">All categories</option>
+        {% for value in categories %}
+        <option value="{{ value }}" {% if filters.category == value %}selected{% endif %}>{{ value }}</option>
+        {% endfor %}
+      </select>
+      <select name="subcategory" class="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm outline-none transition focus:border-blue-500 focus:ring-4 focus:ring-blue-100">
+        <option value="">All sub-categories</option>
+        {% for value in subcategories %}
+        <option value="{{ value }}" {% if filters.subcategory == value %}selected{% endif %}>{{ value }}</option>
+        {% endfor %}
+      </select>
+      <label class="inline-flex items-center gap-2 rounded-xl border border-slate-300 px-3 py-2 text-sm text-slate-600">
+        <input type="checkbox" name="featured" value="1" {% if filters.featured %}checked{% endif %}>
+        Featured only
+      </label>
+      <button class="rounded-xl bg-slate-900 px-4 py-2 text-sm font-semibold text-white transition hover:bg-slate-800">Apply</button>
+    </form>
+  </section>
+
+  <section class="resource-grid">
+    {% for resource in page_obj.object_list %}
+    <a href="/resources/item/{{ resource.id }}/" class="resource-card block">
+      <div class="resource-card-meta">
+        <span>
+          {% if resource.source_published_at %}
+          {{ resource.source_published_at|date:"M d"|upper }}
+          {% else %}
+          DATE N/A
+          {% endif %}
+        </span>
+        {% if resource.section %}
+        <span class="resource-card-topic">{{ resource.section }}</span>
+        {% endif %}
+      </div>
+
+      <div class="resource-card-main">
+        <div>
+          <h2 class="resource-card-title">{{ resource.title }}</h2>
+          {% if resource.summary %}
+          <p class="resource-card-summary">{{ resource.summary|truncatechars:310 }}</p>
+          {% else %}
+          <p class="resource-card-summary italic text-slate-500">Summary unavailable for this resource.</p>
+          {% endif %}
+        </div>
+        {% if resource.image_url %}
+        <div class="resource-card-thumb">
+          <img src="{{ resource.image_url }}" alt="{{ resource.title }}" loading="lazy" />
+        </div>
+        {% endif %}
+      </div>
+
+      <div class="resource-card-taxonomy">
+        {% if resource.category %}
+        <span class="rounded-full bg-blue-50 px-2.5 py-1 text-blue-700">Category: {{ resource.category }}</span>
+        {% endif %}
+        {% if resource.subcategory %}
+        <span class="rounded-full bg-slate-100 px-2.5 py-1 text-slate-700">Sub-category: {{ resource.subcategory }}</span>
+        {% endif %}
+        {% if resource.is_featured %}
+        <span class="rounded-full bg-amber-100 px-2.5 py-1 text-amber-800">Featured</span>
+        {% endif %}
+      </div>
+
+      <div class="resource-card-footer">
+        <span>{{ resource.source_name }}</span>
+        <span class="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700">Open details</span>
+      </div>
+    </a>
+    {% empty %}
+    <div class="col-span-full rounded-2xl border border-slate-200 bg-white p-5 text-sm text-slate-500 shadow-sm">No resources found.</div>
+    {% endfor %}
+  </section>
+
+  {% if page_obj.has_next %}
+  <div class="mt-6 text-center">
+    <a class="rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 transition hover:border-blue-400 hover:text-blue-600" href="?page={{ page_obj.next_page_number }}&q={{ filters.q }}&section={{ filters.section }}&category={{ filters.category }}&subcategory={{ filters.subcategory }}{% if filters.featured %}&featured=1{% endif %}">Load more</a>
+  </div>
+  {% endif %}
+</section>
+{% endblock %}

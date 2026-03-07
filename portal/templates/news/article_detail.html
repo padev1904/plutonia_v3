@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% block title %}{{ article.title }}{% endblock %}
+{% block content %}
+<article class="story-shell mx-auto max-w-5xl rounded-2xl border border-slate-200 bg-white p-5 shadow-sm sm:p-8">
+  {% if is_preview %}
+  <div class="mb-5 rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+    Editorial preview mode. This article is not visible in the public feed until final approval.
+    Current status: <strong>{{ article.editorial_status }}</strong>.
+  </div>
+  {% endif %}
+  <p class="mb-4">
+    <a href="{{ back_url }}" class="inline-flex items-center gap-2 rounded-full border border-slate-300 bg-slate-50 px-3 py-1.5 text-sm text-slate-600 hover:border-blue-400 hover:text-blue-700">← Back</a>
+  </p>
+  <h1 class="story-title mb-3 text-3xl font-extrabold leading-tight text-slate-900 sm:text-4xl">{{ article.title }}</h1>
+  <p class="mb-4 text-sm text-slate-500">{{ article.published_at|date:"Y-m-d" }} · {{ article.source_name }}</p>
+
+  <div class="mb-4 flex flex-wrap gap-2 text-xs font-medium">
+    {% if article.section %}
+      <span class="rounded-full bg-blue-50 px-2.5 py-1 text-blue-700">Section: {{ article.section }}</span>
+    {% endif %}
+    {% if article.category %}
+      <span class="rounded-full bg-emerald-50 px-2.5 py-1 text-emerald-700">Category: {{ article.category }}</span>
+    {% endif %}
+    {% if article.subcategory %}
+      <span class="rounded-full bg-orange-50 px-2.5 py-1 text-orange-700">Sub-category: {{ article.subcategory }}</span>
+    {% endif %}
+  </div>
+
+  {% if article.categories.all %}
+  <div class="mb-4 flex flex-wrap items-center gap-2 text-xs">
+    <span class="text-slate-500">Keywords:</span>
+    {% for cat in article.categories.all %}
+      <a href="/category/{{ cat.slug }}/" class="rounded-full border border-slate-300 bg-slate-50 px-2.5 py-1 text-slate-700 hover:border-blue-400 hover:text-blue-700">{{ cat.name }}</a>
+    {% endfor %}
+  </div>
+  {% endif %}
+
+  {% if article.image_url %}
+  <img src="{{ article.image_url }}" alt="{{ article.title }}" class="mb-7 max-h-[30rem] w-full rounded-2xl border border-slate-200 object-cover" loading="lazy" referrerpolicy="no-referrer">
+  {% endif %}
+  {% if article.summary %}
+  <p class="story-lead mb-7 text-xl leading-8 text-slate-800">{{ article.summary }}</p>
+  {% endif %}
+  <div class="story-body max-w-none text-lg leading-9 text-slate-800">
+    {{ article.enrichment_context|default:article.summary|linebreaks }}
+  </div>
+
+  {% if article.original_url %}
+  <p class="mt-8 text-sm"><a class="font-semibold text-blue-700 hover:text-blue-600" href="{{ article.original_url }}" target="_blank" rel="noopener">Open original source</a></p>
+  {% endif %}
+</article>
+{% endblock %}

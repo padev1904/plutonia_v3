@@ -1,0 +1,15 @@
+<article class="feed-item border-b border-slate-200 py-4 last:border-b-0">
+  <div class="flex items-start justify-between gap-3">
+    <div class="min-w-0">
+      <p class="feed-meta text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">
+        <span>{{ article.published_at|date:"M d"|upper }}</span>
+        <span aria-hidden="true" class="mx-1.5 text-slate-400">·</span>
+        <span>{{ article.section|default:article.source_name }}</span>
+      </p>
+      <h2 class="mt-2 text-xl font-medium leading-snug text-slate-900 sm:text-2xl">
+        <a href="{% url 'news:article-detail' article.id %}" class="feed-title hover:text-blue-700">{{ article.title }}</a>
+      </h2>
+    </div>
+    <div id="favorite-{{ article.id }}" class="shrink-0">{% include "news/partials/favorite_button.html" %}</div>
+  </div>
+</article>

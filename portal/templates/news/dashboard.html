@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block title %}Dashboard · AI News Portal{% endblock %}
+{% block content %}
+<section class="grid gap-4 sm:grid-cols-2 lg:grid-cols-6">
+  <div class="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"><p class="text-xs text-slate-500">Newsletters</p><p class="text-2xl font-bold text-slate-900">{{ newsletter_total }}</p></div>
+  <div class="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"><p class="text-xs text-slate-500">Public Articles</p><p class="text-2xl font-bold text-slate-900">{{ article_total }}</p></div>
+  <div class="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"><p class="text-xs text-slate-500">Preview Pending</p><p class="text-2xl font-bold text-slate-900">{{ preview_pending }}</p></div>
+  <div class="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"><p class="text-xs text-slate-500">Pending</p><p class="text-2xl font-bold text-slate-900">{{ pending }}</p></div>
+  <div class="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"><p class="text-xs text-slate-500">Review</p><p class="text-2xl font-bold text-slate-900">{{ review }}</p></div>
+  <div class="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"><p class="text-xs text-slate-500">Completed</p><p class="text-2xl font-bold text-slate-900">{{ completed }}</p></div>
+</section>
+
+<section class="mt-6 grid gap-4 lg:grid-cols-2">
+  <div class="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+    <h2 class="mb-3 text-sm font-semibold text-slate-800">Top Categories</h2>
+    <ul class="space-y-2 text-sm">
+      {% for c in top_categories %}
+        <li class="flex justify-between"><span class="text-slate-700">{{ c.name }}</span><span class="text-slate-500">{{ c.approved_count }}</span></li>
+      {% empty %}
+        <li class="text-slate-500">No data yet.</li>
+      {% endfor %}
+    </ul>
+  </div>
+
+  <div class="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+    <h2 class="mb-3 text-sm font-semibold text-slate-800">Articles by Day (last 14)</h2>
+    <ul class="space-y-2 text-sm">
+      {% for row in by_day %}
+        <li class="flex justify-between"><span class="text-slate-700">{{ row.day }}</span><span class="text-slate-500">{{ row.total }}</span></li>
+      {% empty %}
+        <li class="text-slate-500">No data yet.</li>
+      {% endfor %}
+    </ul>
+  </div>
+</section>
+{% endblock %}

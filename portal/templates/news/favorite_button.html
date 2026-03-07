@@ -1,0 +1,8 @@
+<button
+  class="rounded-full border px-2.5 py-1 text-xs font-medium transition {% if article.is_favorite %}border-rose-200 bg-rose-50 text-rose-700 hover:bg-rose-100{% else %}border-slate-300 bg-white text-slate-600 hover:border-blue-400 hover:text-blue-700{% endif %}"
+  hx-post="/article/{{ article.id }}/favorite/"
+  hx-target="#favorite-{{ article.id }}"
+  hx-swap="innerHTML"
+>
+  {% if article.is_favorite %}❤ Saved{% else %}♡ Save{% endif %}
+</button>

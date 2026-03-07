@@ -1,0 +1,17 @@
+general:
+  debug: false
+  instance_name: "AI News Search"
+
+search:
+  safe_search: 0
+  autocomplete: "google"
+  default_lang: "en"
+  formats:
+    - html
+    - json
+
+server:
+  port: 8080
+  bind_address: "0.0.0.0"
+  secret_key: "change-me"
+  limiter: false

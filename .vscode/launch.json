@@ -1,0 +1,32 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Attach: gmail-monitor (clean debug, entry breakpoint)",
+      "type": "python",
+      "request": "attach",
+      "connect": { "host": "127.0.0.1", "port": 5679 },
+      "pathMappings": [
+        {
+          "localRoot": "/opt/plutonia/ai-news-portal/scripts",
+          "remoteRoot": "/opt/ai-news-scripts"
+        }
+      ],
+      "justMyCode": false,
+      "preLaunchTask": "ai-news: debug bootstrap (clean)"
+    },
+    {
+      "name": "Attach: gmail-monitor (already running in debug mode)",
+      "type": "python",
+      "request": "attach",
+      "connect": { "host": "127.0.0.1", "port": 5679 },
+      "pathMappings": [
+        {
+          "localRoot": "/opt/plutonia/ai-news-portal/scripts",
+          "remoteRoot": "/opt/ai-news-scripts"
+        }
+      ],
+      "justMyCode": false
+    }
+  ]
+}

@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block title %}Feed · AI News Portal{% endblock %}
+{% block content %}
+<section class="news-hero mb-8">
+  <h1 class="mb-2 text-3xl font-bold text-slate-900 sm:text-4xl">All stories</h1>
+  {% if selected_category %}
+    <p class="text-sm text-slate-500">Category: {{ selected_category.name }}</p>
+  {% endif %}
+</section>
+
+<section class="filter-panel mb-8 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm sm:p-5">
+  <form method="get" class="grid gap-3 sm:grid-cols-2 lg:grid-cols-[2fr_1fr_auto_auto_auto] lg:items-center">
+    <input name="q" value="{{ filters.q }}" placeholder="Search in article titles and summaries" class="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm outline-none transition focus:border-blue-500 focus:ring-4 focus:ring-blue-100" />
+    <select name="category" class="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm outline-none transition focus:border-blue-500 focus:ring-4 focus:ring-blue-100">
+      <option value="">All categories</option>
+      {% for c in categories %}
+      <option value="{{ c.slug }}" {% if filters.category == c.slug %}selected{% endif %}>{{ c.name }}</option>
+      {% endfor %}
+    </select>
+    <label class="inline-flex items-center gap-2 rounded-xl border border-slate-300 px-3 py-2 text-sm text-slate-600">
+      <input type="checkbox" name="favorites" value="1" {% if filters.favorites %}checked{% endif %}>
+      Favorites
+    </label>
+    <label class="inline-flex items-center gap-2 rounded-xl border border-slate-300 px-3 py-2 text-sm text-slate-600">
+      <input type="checkbox" name="unread" value="1" {% if filters.unread %}checked{% endif %}>
+      Unread
+    </label>
+    <button class="rounded-xl bg-slate-900 px-4 py-2 text-sm font-semibold text-white transition hover:bg-slate-800">Apply</button>
+  </form>
+</section>
+
+<section>
+  <div id="article-list" class="feed-list flex flex-col rounded-2xl border border-slate-200 bg-white px-4 py-2 shadow-sm sm:px-5">
+    {% include "news/partials/article_cards.html" %}
+  </div>
+
+  {% if page_obj.has_next %}
+    <div class="mt-6 text-center">
+      <button
+        class="rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 transition hover:border-blue-400 hover:text-blue-600"
+        hx-get="?page={{ page_obj.next_page_number }}&q={{ filters.q }}&category={{ filters.category }}{% if filters.favorites %}&favorites=1{% endif %}{% if filters.unread %}&unread=1{% endif %}"
+        hx-target="#article-list"
+        hx-swap="beforeend"
+      >Load more</button>
+    </div>
+  {% endif %}
+</section>
+{% endblock %}

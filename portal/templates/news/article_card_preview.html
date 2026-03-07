@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block title %}Card preview · {{ article.title }}{% endblock %}
+{% block content %}
+<section class="mx-auto max-w-7xl">
+  {% if is_preview %}
+  <div class="mb-5 rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+    Card preview mode. The highlighted card is private until final editorial approval.
+  </div>
+  {% endif %}
+
+  <div class="grid gap-5 sm:grid-cols-2 xl:grid-cols-3">
+    {% for card in cards %}
+    <article data-preview-card class="news-card overflow-hidden rounded-2xl border bg-white shadow-sm {% if card.id == target_id %}ring-2 ring-blue-500 ring-offset-2{% else %}border-slate-200{% endif %}">
+      <div class="news-card-image h-48 w-full">
+        {% if card.image_url %}
+          <img src="{{ card.image_url }}" alt="{{ card.title }}" class="h-full w-full object-cover" loading="lazy" referrerpolicy="no-referrer">
+        {% else %}
+          <div class="h-full w-full bg-slate-200"></div>
+        {% endif %}
+      </div>
+      <div class="flex h-[20rem] flex-col p-4">
+        <p class="text-xs font-semibold uppercase tracking-[0.14em] text-slate-500">
+          {{ card.published_at|date:"M d"|upper }} · {{ card.section|default:card.source_name }}
+        </p>
+        <h2 class="mt-2 text-xl font-bold leading-snug text-slate-900">{{ card.title }}</h2>
+        <p class="news-card-summary mt-3 text-sm leading-6 text-slate-700">{{ card.summary|default:"Summary unavailable." }}</p>
+
+        <div class="mt-4 flex flex-wrap gap-2 text-[11px] font-medium">
+          {% if card.section %}
+            <span class="rounded-full bg-blue-50 px-2 py-1 text-blue-700">Section: {{ card.section }}</span>
+          {% endif %}
+          {% if card.category %}
+            <span class="rounded-full bg-emerald-50 px-2 py-1 text-emerald-700">Category: {{ card.category }}</span>
+          {% endif %}
+          {% if card.subcategory %}
+            <span class="rounded-full bg-orange-50 px-2 py-1 text-orange-700">Sub-category: {{ card.subcategory }}</span>
+          {% endif %}
+        </div>
+
+        <div class="mt-auto pt-4">
+          {% if card.id == target_id %}
+            <a href="{{ detail_preview_path }}" class="inline-flex items-center rounded-lg border border-blue-300 bg-blue-50 px-3 py-1.5 text-sm font-semibold text-blue-700 hover:border-blue-500 hover:bg-blue-100">
+              Open detail preview
+            </a>
+          {% else %}
+            <a href="{% url 'news:article-detail' card.id %}" class="inline-flex items-center rounded-lg border border-slate-300 bg-slate-50 px-3 py-1.5 text-sm font-semibold text-slate-700 hover:border-blue-400 hover:text-blue-700">
+              Open public article
+            </a>
+          {% endif %}
+        </div>
+      </div>
+    </article>
+    {% endfor %}
+
+    {% for _i in placeholder_range %}
+    <article class="news-card overflow-hidden rounded-2xl border border-dashed border-slate-300 bg-slate-50 p-4 shadow-sm">
+      <div class="h-48 rounded-xl bg-slate-200"></div>
+      <div class="mt-4 h-4 w-3/4 rounded bg-slate-200"></div>
+      <div class="mt-3 h-3 w-full rounded bg-slate-200"></div>
+      <div class="mt-2 h-3 w-5/6 rounded bg-slate-200"></div>
+    </article>
+    {% endfor %}
+  </div>
+</section>
+{% endblock %}

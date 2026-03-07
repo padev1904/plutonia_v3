@@ -39,8 +39,8 @@ services:
 
   comfyui:
     build:
-      context: .
-      dockerfile: docker/comfyui/Dockerfile
+      context: ./docker/comfyui
+      dockerfile: Dockerfile
     container_name: plutonia-comfyui-1
     restart: unless-stopped
     gpus: all
@@ -84,8 +84,8 @@ services:
   openclaw:
     container_name: plutonia-openclaw
     build:
-      context: .
-      dockerfile: docker/openclaw/Dockerfile
+      context: ./docker/openclaw
+      dockerfile: Dockerfile
     restart: unless-stopped
     depends_on:
       ollama:

@@ -150,7 +150,7 @@ services:
     ports:
       - "8081:8080"
     volumes:
-      - ./searxng:/etc/searxng:ro
+      - ./searxng:/etc/searxng
       - searxng-cache:/var/cache/searxng
     networks:
       - ainews-net

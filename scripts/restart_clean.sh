@@ -4,11 +4,8 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
 COMPOSE_CMD=(docker compose -p plutonia-ainews -f "${ROOT_DIR}/docker-compose.yml")
-ROOT_COMPOSE_CMD=(docker compose -p plutonia -f /opt/plutonia/docker-compose.yml)
-LEGACY_PROJECT_CMD=(docker compose -p ai-news-portal -f "${ROOT_DIR}/docker-compose.yml")
 
 echo "[clean-restart] removing legacy ai-news-portal project containers (name-collision guard)..."
-"${LEGACY_PROJECT_CMD[@]}" down --remove-orphans >/dev/null 2>&1 || true
 if [ -f /home/python/ai-news-portal/docker-compose.yml ]; then
   docker compose -p ai-news-portal -f /home/python/ai-news-portal/docker-compose.yml down --remove-orphans >/dev/null 2>&1 || true
 fi
@@ -155,8 +152,8 @@ printf "{}\n" > "${d}/sessions.json"
   hardguard_hits="$(docker exec plutonia-openclaw sh -lc 'grep -R "__PLUTONIA_REVIEW_NO_REPLY_GUARD_V6__" -n /usr/local/lib/node_modules/openclaw/dist/reply-*.js /usr/local/lib/node_modules/openclaw/dist/plugin-sdk/reply-*.js | wc -l')"
   if [ "${hardguard_hits}" -lt 2 ]; then
     echo "[clean-restart] hard-guard marker V6 missing -> rebuilding openclaw image..."
-    "${ROOT_COMPOSE_CMD[@]}" build openclaw
-    "${ROOT_COMPOSE_CMD[@]}" up -d --no-deps --force-recreate openclaw
+    "${COMPOSE_CMD[@]}" build openclaw
+    "${COMPOSE_CMD[@]}" up -d --no-deps --force-recreate openclaw
     hardguard_hits="$(docker exec plutonia-openclaw sh -lc 'grep -R "__PLUTONIA_REVIEW_NO_REPLY_GUARD_V6__" -n /usr/local/lib/node_modules/openclaw/dist/reply-*.js /usr/local/lib/node_modules/openclaw/dist/plugin-sdk/reply-*.js | wc -l')"
   fi
   echo "[clean-restart] openclaw hard-guard marker hits=${hardguard_hits}"

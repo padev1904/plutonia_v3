@@ -1,0 +1,8 @@
+.env
+config/gmail/
+config/ssh/
+config/plutonia.env
+review/
+portal/.pytest_cache/
+portal/**/__pycache__/
+scripts/**/__pycache__/

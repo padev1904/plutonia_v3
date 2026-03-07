@@ -1,0 +1,7 @@
+# Ollama model routing used by the core infra stack.
+routing:
+  technical: "qwen3-coder:30b"
+  general: "qwen3:32b"
+  embeddings: "mxbai-embed-large"
+
+ollama_base_url: "http://ollama:11434"

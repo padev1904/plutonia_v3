@@ -1,6 +1,160 @@
 name: plutonia-ainews
 
 services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: plutonia-postgres-1
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: plutonia
+      POSTGRES_USER: python
+      POSTGRES_PASSWORD: ${PLUTONIA_DB_PASSWORD:-}
+    volumes:
+      - /var/lib/plutonia/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U python -d plutonia"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - ainews-net
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: plutonia-ollama-1
+    restart: unless-stopped
+    gpus: all
+    environment:
+      OLLAMA_KEEP_ALIVE: "5m"
+    volumes:
+      - /usr/share/ollama/.ollama:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - ainews-net
+
+  comfyui:
+    build:
+      context: .
+      dockerfile: docker/comfyui/Dockerfile
+    container_name: plutonia-comfyui-1
+    restart: unless-stopped
+    gpus: all
+    volumes:
+      - /opt/plutonia/models:/comfyui/models
+      - /var/lib/plutonia/comfyui/output:/comfyui/output
+    ports:
+      - "127.0.0.1:8188:8188"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8188/system_stats || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    networks:
+      - ainews-net
+
+  litellm:
+    image: ghcr.io/berriai/litellm:main-latest
+    container_name: plutonia-litellm-1
+    restart: unless-stopped
+    depends_on:
+      ollama:
+        condition: service_healthy
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    environment:
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-}
+    volumes:
+      - ./config/litellm.yaml:/app/config.yaml:ro
+    ports:
+      - "127.0.0.1:4000:4000"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4000/health/liveliness')"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - ainews-net
+
+  openclaw:
+    container_name: plutonia-openclaw
+    build:
+      context: .
+      dockerfile: docker/openclaw/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      ollama:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      comfyui:
+        condition: service_healthy
+    environment:
+      SEARXNG_URL: http://searxng:8080
+      OLLAMA_API_KEY: ollama-local
+      OLLAMA_BASE_URL: http://ollama:11434
+      OLLAMA_HOST: http://ollama:11434
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+    volumes:
+      - /home/python/.openclaw:/root/.openclaw
+      - /var/lib/plutonia:/var/lib/plutonia
+      - /var/backups/plutonia:/var/backups/plutonia
+      - /var/log/plutonia:/var/log/plutonia
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "127.0.0.1:18789:18789"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:18789/ >/dev/null || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - ainews-net
+
+  uptime-kuma:
+    image: louislam/uptime-kuma:1
+    container_name: plutonia-uptime-kuma-1
+    restart: unless-stopped
+    volumes:
+      - /var/lib/plutonia/uptime-kuma:/app/data
+    ports:
+      - "127.0.0.1:3002:3001"
+    networks:
+      - ainews-net
+
+  autoheal:
+    image: willfarrell/autoheal:latest
+    container_name: plutonia-autoheal-1
+    restart: unless-stopped
+    environment:
+      AUTOHEAL_CONTAINER_LABEL: all
+      AUTOHEAL_INTERVAL: 30
+      AUTOHEAL_START_PERIOD: 60
+      AUTOHEAL_DEFAULT_STOP_TIMEOUT: 10
+      DOCKER_SOCK: /var/run/docker.sock
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - ainews-net
+
+  searxng:
+    image: searxng/searxng:latest
+    container_name: searxng
+    restart: unless-stopped
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./searxng:/etc/searxng:ro
+      - searxng-cache:/var/cache/searxng
+    networks:
+      - ainews-net
+
   portal:
     build:
       context: .
@@ -25,6 +179,9 @@ services:
       timeout: 5s
       retries: 10
       start_period: 30s
+    depends_on:
+      postgres:
+        condition: service_healthy
     networks:
       - ainews-net
 
@@ -81,6 +238,8 @@ services:
     depends_on:
       portal:
         condition: service_healthy
+      openclaw:
+        condition: service_healthy
     networks:
       - ainews-net
 
@@ -119,3 +278,4 @@ networks:
 volumes:
   portal-staticfiles:
   portal-logs:
+  searxng-cache:

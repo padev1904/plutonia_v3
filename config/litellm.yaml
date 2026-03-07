@@ -1,0 +1,22 @@
+model_list:
+  - model_name: qwen3-coder
+    litellm_params:
+      model: ollama/qwen3-coder:30b
+      api_base: http://ollama:11434
+
+  - model_name: qwen3
+    litellm_params:
+      model: ollama/qwen3:32b
+      api_base: http://ollama:11434
+
+  - model_name: mxbai-embed-large
+    litellm_params:
+      model: ollama/mxbai-embed-large
+      api_base: http://ollama:11434
+
+litellm_settings:
+  drop_params: true
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  disable_health_check: true

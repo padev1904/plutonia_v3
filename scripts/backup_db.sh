@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BACKUP_DIR="/opt/plutonia/ai-news-portal/backups"
+BACKUP_DIR="${BACKUP_DIR:-/var/backups/plutonia}"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$BACKUP_DIR"
 

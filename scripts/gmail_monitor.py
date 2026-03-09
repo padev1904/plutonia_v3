@@ -80,6 +80,7 @@ WATCHDOG_PROCESSING_STUCK_SECONDS = 900
 WATCHDOG_NOTIFY_MIN_INTERVAL_SECONDS = 300
 WATCHDOG_DISK_FREE_ALERT_PCT = 5.0
 WATCHDOG_ACTION_HISTORY_LIMIT = 20
+WATCHDOG_WORKER_STALE_SECONDS = 90
 WATCHDOG_STATUS_FILE = "/review/ops_watchdog_status.json"
 
 _PROCESS_NEXT_PENDING_LOCK = threading.Lock()
@@ -88,6 +89,7 @@ _RUNTIME_STATE: dict[str, Any] = {
     "worker_heartbeats": {},
     "last_actions": [],
     "last_notifications": {},
+    "restart_request": None,
 }
 
 
@@ -99,6 +101,7 @@ def _refresh_watchdog_settings() -> None:
     global WATCHDOG_NOTIFY_MIN_INTERVAL_SECONDS
     global WATCHDOG_DISK_FREE_ALERT_PCT
     global WATCHDOG_ACTION_HISTORY_LIMIT
+    global WATCHDOG_WORKER_STALE_SECONDS
     global WATCHDOG_STATUS_FILE
 
     WATCHDOG_ENABLED = _is_truthy(os.getenv("PIPELINE_WATCHDOG_ENABLED", "1"))
@@ -108,6 +111,7 @@ def _refresh_watchdog_settings() -> None:
     WATCHDOG_NOTIFY_MIN_INTERVAL_SECONDS = max(60, int(os.getenv("PIPELINE_WATCHDOG_NOTIFY_MIN_INTERVAL_SECONDS", "300")))
     WATCHDOG_DISK_FREE_ALERT_PCT = float(os.getenv("PIPELINE_WATCHDOG_DISK_FREE_ALERT_PCT", "5"))
     WATCHDOG_ACTION_HISTORY_LIMIT = max(5, int(os.getenv("PIPELINE_WATCHDOG_ACTION_HISTORY_LIMIT", "20")))
+    WATCHDOG_WORKER_STALE_SECONDS = max(45, int(os.getenv("PIPELINE_WATCHDOG_WORKER_STALE_SECONDS", "90")))
     WATCHDOG_STATUS_FILE = os.getenv("WATCHDOG_STATUS_FILE", "/review/ops_watchdog_status.json").strip() or "/review/ops_watchdog_status.json"
 
 
@@ -175,6 +179,7 @@ def _runtime_snapshot() -> dict[str, Any]:
         return {
             "worker_heartbeats": json.loads(json.dumps(_RUNTIME_STATE.get("worker_heartbeats", {}))),
             "last_actions": json.loads(json.dumps(_RUNTIME_STATE.get("last_actions", []))),
+            "restart_request": json.loads(json.dumps(_RUNTIME_STATE.get("restart_request"))),
         }
 
 
@@ -197,6 +202,44 @@ def _notify_watchdog(cfg: Config, notification_key: str, text: str) -> bool:
     except Exception as exc:
         LOG.warning("watchdog telegram notify failed key=%s err=%s", key, exc)
         return False
+
+
+def _heartbeat_age_seconds(value: Any) -> float | None:
+    dt = _parse_iso_datetime(value)
+    if dt is None:
+        return None
+    return max(0.0, (datetime.now(tz=UTC) - dt).total_seconds())
+
+
+def _worker_heartbeat_snapshot(name: str) -> dict[str, Any]:
+    runtime = _runtime_snapshot()
+    worker_heartbeats = runtime.get("worker_heartbeats", {}) if isinstance(runtime, dict) else {}
+    entry = worker_heartbeats.get(name, {}) if isinstance(worker_heartbeats, dict) else {}
+    return entry if isinstance(entry, dict) else {}
+
+
+def _request_monitor_restart(reason: str, **details: Any) -> dict[str, Any]:
+    request = {
+        "at": _utcnow_iso(),
+        "reason": str(reason or "watchdog_requested_restart").strip() or "watchdog_requested_restart",
+    }
+    for key, value in details.items():
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        request[key] = value
+
+    with _RUNTIME_STATE_LOCK:
+        _RUNTIME_STATE["restart_request"] = request
+    return request
+
+
+def _pop_restart_request() -> dict[str, Any] | None:
+    with _RUNTIME_STATE_LOCK:
+        request = _RUNTIME_STATE.get("restart_request")
+        _RUNTIME_STATE["restart_request"] = None
+    return request if isinstance(request, dict) else None
 
 
 def _fetch_newsletter_status_page(
@@ -382,8 +425,16 @@ def _pipeline_watchdog_worker(
             observed = _observe_pipeline_state(cfg)
             now_ts = time.time()
 
-            pending_row, pending_age = _update_stuck_tracker(tracker, "pending", observed["current"].get("pending", []), now_ts)
-            processing_row, processing_age = _update_stuck_tracker(tracker, "processing", observed["current"].get("processing", []), now_ts)
+            pending_rows = observed["current"].get("pending", [])
+            processing_rows = observed["current"].get("processing", [])
+            review_rows = observed["current"].get("review", [])
+
+            pending_row, pending_age = _update_stuck_tracker(tracker, "pending", pending_rows, now_ts)
+            processing_row, processing_age = _update_stuck_tracker(tracker, "processing", processing_rows, now_ts)
+
+            process_heartbeat = _worker_heartbeat_snapshot("process")
+            process_heartbeat_age = _heartbeat_age_seconds(process_heartbeat.get("at"))
+            process_heartbeat_state = str(process_heartbeat.get("state", "")).strip()
 
             disk_free_pct = observed.get("health", {}).get("disk_free_pct")
             if isinstance(disk_free_pct, (int, float)) and disk_free_pct <= WATCHDOG_DISK_FREE_ALERT_PCT:
@@ -486,6 +537,89 @@ def _pipeline_watchdog_worker(
                                 f"newsletter_id={processing_row.get('id')} uid={processing_row.get('gmail_uid')}",
                                 f"subject={processing_row.get('subject', '')}",
                                 "action=none_safe_lock_active",
+                            ],
+                        ),
+                    )
+
+            if (
+                process_heartbeat_age is not None
+                and process_heartbeat_age >= WATCHDOG_WORKER_STALE_SECONDS
+                and not processing_rows
+                and not review_rows
+            ):
+                stalled_blocker = {
+                    "type": "process_worker_stalled",
+                    "age_seconds": round(process_heartbeat_age, 1),
+                    "heartbeat_state": process_heartbeat_state or "unknown",
+                }
+                if pending_row:
+                    stalled_blocker.update(
+                        {
+                            "newsletter_id": pending_row.get("id"),
+                            "gmail_uid": pending_row.get("gmail_uid"),
+                            "subject": pending_row.get("subject"),
+                        }
+                    )
+                blockers.append(stalled_blocker)
+
+                if pending_row and not _PROCESS_NEXT_PENDING_LOCK.locked():
+                    result = _recover_pending_with_fresh_imap(cfg, gmail_address, gmail_app_password)
+                    _record_runtime_action(
+                        "stalled_process_recovery",
+                        "Recovered pending newsletter while process worker heartbeat was stale",
+                        newsletter_id=pending_row.get("id"),
+                        gmail_uid=pending_row.get("gmail_uid"),
+                        heartbeat_age_seconds=round(process_heartbeat_age, 1),
+                        result=result,
+                    )
+                    _notify_watchdog(
+                        cfg,
+                        f"stalled_process_recovery:{pending_row.get('id')}:{result.get('status')}",
+                        _format_watchdog_event(
+                            "Watchdog: stale process worker recovery",
+                            [
+                                f"newsletter_id={pending_row.get('id')} uid={pending_row.get('gmail_uid')}",
+                                f"subject={pending_row.get('subject', '')}",
+                                f"heartbeat_age={round(process_heartbeat_age, 1)}s state={process_heartbeat_state or 'unknown'}",
+                                "action=process_next_pending_fresh_imap",
+                                f"result={result.get('status')}",
+                            ],
+                        ),
+                    )
+                    observed = _observe_pipeline_state(cfg)
+                    pending_rows = observed["current"].get("pending", [])
+                    review_rows = observed["current"].get("review", [])
+                    processing_rows = observed["current"].get("processing", [])
+                    tracker["pending"] = None
+                    process_heartbeat = _worker_heartbeat_snapshot("process")
+                    process_heartbeat_age = _heartbeat_age_seconds(process_heartbeat.get("at"))
+                    process_heartbeat_state = str(process_heartbeat.get("state", "")).strip()
+
+                if process_heartbeat_age is not None and process_heartbeat_age >= WATCHDOG_WORKER_STALE_SECONDS:
+                    restart_request = _request_monitor_restart(
+                        "process_worker_stalled",
+                        heartbeat_age_seconds=round(process_heartbeat_age, 1),
+                        heartbeat_state=process_heartbeat_state or "unknown",
+                        newsletter_id=(pending_row.get("id") if pending_row else None),
+                        gmail_uid=(pending_row.get("gmail_uid") if pending_row else None),
+                    )
+                    _record_runtime_action(
+                        "monitor_restart_requested",
+                        "Requested monitor restart after stalled process worker",
+                        reason=restart_request.get("reason"),
+                        heartbeat_age_seconds=restart_request.get("heartbeat_age_seconds"),
+                        newsletter_id=restart_request.get("newsletter_id"),
+                        gmail_uid=restart_request.get("gmail_uid"),
+                    )
+                    _notify_watchdog(
+                        cfg,
+                        f"monitor_restart_requested:{restart_request.get('reason')}:{restart_request.get('newsletter_id') or 'none'}",
+                        _format_watchdog_event(
+                            "Watchdog: monitor restart requested",
+                            [
+                                f"reason={restart_request.get('reason')}",
+                                f"heartbeat_age={restart_request.get('heartbeat_age_seconds')}s state={restart_request.get('heartbeat_state')}",
+                                f"newsletter_id={restart_request.get('newsletter_id') or '-'} uid={restart_request.get('gmail_uid') or '-'}",
                             ],
                         ),
                     )
@@ -2165,6 +2299,9 @@ def run_monitor_parallel_mode(cfg: Config, gmail_address: str, gmail_app_passwor
     try:
         while True:
             _mark_worker_heartbeat("main", "heartbeat")
+            restart_request = _pop_restart_request()
+            if restart_request:
+                raise RuntimeError(f"watchdog requested restart: {json.dumps(restart_request, ensure_ascii=False)}")
             if not ingest_thread.is_alive():
                 raise RuntimeError("ingest worker stopped unexpectedly")
             if not process_thread.is_alive():

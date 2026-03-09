@@ -19,6 +19,7 @@ import logging
 import os
 import re
 import threading
+import unicodedata
 import time
 from pathlib import Path
 from typing import Any
@@ -56,6 +57,7 @@ TELEGRAM_TRIAGE_INTERVAL = int(os.getenv("TELEGRAM_TRIAGE_INTERVAL", "15"))
 TELEGRAM_TRIAGE_NEWSLETTER_ID = os.getenv("TELEGRAM_TRIAGE_NEWSLETTER_ID", "").strip()
 CLOUDFLARED_CONTAINER_NAME = os.getenv("CLOUDFLARED_CONTAINER_NAME", "ainews-cloudflared").strip()
 REVIEW_OUTPUT_DIR = os.getenv("REVIEW_OUTPUT_DIR", "/review").strip() or "/review"
+WATCHDOG_STATUS_FILE = os.getenv("WATCHDOG_STATUS_FILE", "/review/ops_watchdog_status.json").strip() or "/review/ops_watchdog_status.json"
 
 # Per-task model configuration (Fase 6)
 OLLAMA_MODEL_TITLE = os.getenv("OLLAMA_MODEL_TITLE", "").strip()
@@ -137,6 +139,198 @@ def _api_post(cfg: Config, path: str, payload: dict) -> dict:
     )
     resp.raise_for_status()
     return resp.json()
+
+
+def _watchdog_status_path(cfg: Config) -> Path:
+    raw = str(WATCHDOG_STATUS_FILE or "").strip()
+    if not raw:
+        return Path(cfg.review_output_dir) / "ops_watchdog_status.json"
+    path = Path(raw)
+    if path.is_absolute():
+        return path
+    return Path(cfg.review_output_dir) / raw
+
+
+def _strip_accents(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", str(value or ""))
+    return "".join(ch for ch in normalized if not unicodedata.combining(ch))
+
+
+def _looks_like_status_query(user_text: str) -> bool:
+    raw = str(user_text or "").strip()
+    if not raw:
+        return False
+    if raw.startswith("http://") or raw.startswith("https://"):
+        return False
+    normalized = " ".join(_strip_accents(raw).lower().split())
+    if len(normalized) > 80:
+        return False
+    exact = {
+        "status",
+        "estado",
+        "pipeline",
+        "estado do pipeline",
+        "novo status",
+        "da me novo status",
+        "ponto de situacao",
+        "como esta",
+        "como esta o pipeline",
+        "algum bloqueio",
+        "ha algum bloqueio",
+    }
+    if normalized in exact:
+        return True
+    starts = (
+        "status ",
+        "pipeline ",
+        "como esta",
+        "ha algum bloqueio",
+        "algum bloqueio",
+        "ponto de situacao",
+        "da me novo status",
+    )
+    return normalized.startswith(starts)
+
+
+def _load_watchdog_status(cfg: Config) -> dict[str, Any] | None:
+    path = _watchdog_status_path(cfg)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        LOG.warning("failed to read watchdog status file=%s err=%s", path, exc)
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _live_pipeline_status(cfg: Config) -> dict[str, Any]:
+    statuses = ("pending", "processing", "review", "completed", "error")
+    counts: dict[str, int] = {}
+    current: dict[str, list[dict[str, Any]]] = {}
+    for status in statuses:
+        payload = _api_get(cfg, "newsletter/pending/", {"status": status, "limit": 3, "mode": "oldest"})
+        rows = payload.get("newsletters", []) if isinstance(payload, dict) else []
+        if not isinstance(rows, list):
+            rows = []
+        rows = [row for row in rows if isinstance(row, dict)]
+        counts[status] = int(payload.get("pending_count", len(rows)) if isinstance(payload, dict) else len(rows))
+        current[status] = rows
+
+    article_payload = _api_get(cfg, "articles/editorial-pending/", {"mode": "oldest", "exclude_tg_triaged": "true"})
+    article = article_payload.get("article") if isinstance(article_payload, dict) else None
+    return {
+        "observed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "counts": counts,
+        "current": current,
+        "active_article": article if isinstance(article, dict) else None,
+        "editorial_queue": {
+            "status": str(article_payload.get("status", "")) if isinstance(article_payload, dict) else "",
+            "reason": str(article_payload.get("reason", "")) if isinstance(article_payload, dict) else "",
+        },
+        "blockers": [],
+        "runtime": {"last_actions": []},
+        "health": {"review_api_ok": True},
+    }
+
+
+def _format_status_row(row: dict[str, Any]) -> str:
+    newsletter_id = row.get("id") or row.get("newsletter_id") or "?"
+    uid = row.get("gmail_uid") or "-"
+    subject = str(row.get("subject", "")).strip() or str(row.get("title", "")).strip() or "sem assunto"
+    if len(subject) > 90:
+        subject = subject[:87].rstrip() + "..."
+    return f"#{newsletter_id} uid={uid} {subject}"
+
+
+def _format_pipeline_status_message(payload: dict[str, Any]) -> str:
+    observed_at = str(payload.get("observed_at", "")).strip() or "n/a"
+    counts = payload.get("counts", {}) if isinstance(payload, dict) else {}
+    current = payload.get("current", {}) if isinstance(payload, dict) else {}
+    blockers = payload.get("blockers", []) if isinstance(payload, dict) else []
+    runtime = payload.get("runtime", {}) if isinstance(payload, dict) else {}
+    active_article = payload.get("active_article") if isinstance(payload, dict) else None
+    editorial_queue = payload.get("editorial_queue", {}) if isinstance(payload, dict) else {}
+    health = payload.get("health", {}) if isinstance(payload, dict) else {}
+
+    lines = [
+        "Estado do pipeline",
+        f"Observado em: {observed_at}",
+        "",
+        "Counts:",
+        f"- pending: {counts.get('pending', 0)}",
+        f"- processing: {counts.get('processing', 0)}",
+        f"- review: {counts.get('review', 0)}",
+        f"- completed: {counts.get('completed', 0)}",
+        f"- error: {counts.get('error', 0)}",
+    ]
+
+    for status in ("processing", "review", "pending", "error"):
+        rows = current.get(status, []) if isinstance(current, dict) else []
+        if not isinstance(rows, list) or not rows:
+            continue
+        lines.append("")
+        lines.append(f"{status.capitalize()} atuais:")
+        for row in rows[:2]:
+            if isinstance(row, dict):
+                lines.append(f"- {_format_status_row(row)}")
+
+    if isinstance(active_article, dict) and active_article:
+        title = str(active_article.get("title", "")).strip() or "sem titulo"
+        if len(title) > 90:
+            title = title[:87].rstrip() + "..."
+        lines.append("")
+        lines.append("Artigo ativo:")
+        lines.append(
+            f"- #{active_article.get('id', '?')} newsletter={active_article.get('newsletter_id', '?')} "
+            f"status={active_article.get('telegram_triage_status', '-') or '-'} {title}"
+        )
+    elif str(editorial_queue.get("reason", "")).strip() == "active_triage_exists":
+        lines.append("")
+        lines.append("Artigo ativo: triagem em curso")
+
+    if isinstance(blockers, list) and blockers:
+        lines.append("")
+        lines.append("Bloqueios:")
+        for blocker in blockers[:3]:
+            if not isinstance(blocker, dict):
+                continue
+            parts = [str(blocker.get("type", "bloqueio"))]
+            if blocker.get("newsletter_id"):
+                parts.append(f"newsletter={blocker.get('newsletter_id')}")
+            if blocker.get("gmail_uid"):
+                parts.append(f"uid={blocker.get('gmail_uid')}")
+            if blocker.get("age_seconds") is not None:
+                parts.append(f"age={blocker.get('age_seconds')}s")
+            if blocker.get("message"):
+                parts.append(str(blocker.get("message")))
+            lines.append(f"- {' | '.join(parts)}")
+
+    actions = runtime.get("last_actions", []) if isinstance(runtime, dict) else []
+    if isinstance(actions, list) and actions:
+        lines.append("")
+        lines.append("Ultimas acoes:")
+        for action in actions[-3:]:
+            if not isinstance(action, dict):
+                continue
+            lines.append(
+                f"- {str(action.get('at', ''))[-9:-1] or action.get('at', 'n/a')} "
+                f"{action.get('type', 'acao')}: {action.get('message', '')}"
+            )
+
+    if isinstance(health, dict) and health.get("disk_free_pct") is not None:
+        lines.append("")
+        lines.append(f"Disco livre review: {health.get('disk_free_pct')}%")
+
+    return "\n".join(lines)
+
+
+def _build_status_reply(cfg: Config) -> str:
+    payload = _load_watchdog_status(cfg)
+    if payload is None:
+        payload = _live_pipeline_status(cfg)
+    return _format_pipeline_status_message(payload)
+
 
 
 # ---------------------------------------------------------------------------
@@ -1143,13 +1337,24 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     if not user_text:
         return
 
+    cfg = _get_cfg()
+    if _looks_like_status_query(user_text):
+        try:
+            await update.message.reply_text(
+                _build_status_reply(cfg),
+                disable_web_page_preview=True,
+            )
+        except Exception as exc:
+            await update.message.reply_text(f"Erro ao obter estado do pipeline: {exc}")
+        return
+
     pending = _pop_pending_input(chat_id) if chat_id else None
     if not pending:
         return
 
+
     article_id = pending["article_id"]
     action = pending["action"]
-    cfg = _get_cfg()
 
     try:
         if action == "edittitle":

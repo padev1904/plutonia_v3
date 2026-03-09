@@ -20,6 +20,7 @@ import shlex
 import threading
 import time
 import requests
+import shutil
 from datetime import UTC, datetime
 from email.header import decode_header
 from email.message import Message
@@ -71,6 +72,462 @@ _TELEGRAM_CONFIG_CACHE: tuple[str, str] | None = None
 def _is_truthy(value: str | None) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
+
+WATCHDOG_ENABLED = False
+WATCHDOG_INTERVAL_SECONDS = 30
+WATCHDOG_PENDING_STUCK_SECONDS = 300
+WATCHDOG_PROCESSING_STUCK_SECONDS = 900
+WATCHDOG_NOTIFY_MIN_INTERVAL_SECONDS = 300
+WATCHDOG_DISK_FREE_ALERT_PCT = 5.0
+WATCHDOG_ACTION_HISTORY_LIMIT = 20
+WATCHDOG_STATUS_FILE = "/review/ops_watchdog_status.json"
+
+_PROCESS_NEXT_PENDING_LOCK = threading.Lock()
+_RUNTIME_STATE_LOCK = threading.Lock()
+_RUNTIME_STATE: dict[str, Any] = {
+    "worker_heartbeats": {},
+    "last_actions": [],
+    "last_notifications": {},
+}
+
+
+def _refresh_watchdog_settings() -> None:
+    global WATCHDOG_ENABLED
+    global WATCHDOG_INTERVAL_SECONDS
+    global WATCHDOG_PENDING_STUCK_SECONDS
+    global WATCHDOG_PROCESSING_STUCK_SECONDS
+    global WATCHDOG_NOTIFY_MIN_INTERVAL_SECONDS
+    global WATCHDOG_DISK_FREE_ALERT_PCT
+    global WATCHDOG_ACTION_HISTORY_LIMIT
+    global WATCHDOG_STATUS_FILE
+
+    WATCHDOG_ENABLED = _is_truthy(os.getenv("PIPELINE_WATCHDOG_ENABLED", "1"))
+    WATCHDOG_INTERVAL_SECONDS = max(10, int(os.getenv("PIPELINE_WATCHDOG_INTERVAL_SECONDS", "30")))
+    WATCHDOG_PENDING_STUCK_SECONDS = max(60, int(os.getenv("PIPELINE_WATCHDOG_PENDING_STUCK_SECONDS", "300")))
+    WATCHDOG_PROCESSING_STUCK_SECONDS = max(120, int(os.getenv("PIPELINE_WATCHDOG_PROCESSING_STUCK_SECONDS", "900")))
+    WATCHDOG_NOTIFY_MIN_INTERVAL_SECONDS = max(60, int(os.getenv("PIPELINE_WATCHDOG_NOTIFY_MIN_INTERVAL_SECONDS", "300")))
+    WATCHDOG_DISK_FREE_ALERT_PCT = float(os.getenv("PIPELINE_WATCHDOG_DISK_FREE_ALERT_PCT", "5"))
+    WATCHDOG_ACTION_HISTORY_LIMIT = max(5, int(os.getenv("PIPELINE_WATCHDOG_ACTION_HISTORY_LIMIT", "20")))
+    WATCHDOG_STATUS_FILE = os.getenv("WATCHDOG_STATUS_FILE", "/review/ops_watchdog_status.json").strip() or "/review/ops_watchdog_status.json"
+
+
+def _utcnow_iso() -> str:
+    return datetime.now(tz=UTC).isoformat()
+
+
+def _watchdog_status_path(cfg: Config) -> Path:
+    raw = str(WATCHDOG_STATUS_FILE or "").strip()
+    if not raw:
+        return Path(cfg.review_output_dir) / "ops_watchdog_status.json"
+    path = Path(raw)
+    if path.is_absolute():
+        return path
+    return Path(cfg.review_output_dir) / raw
+
+
+def _parse_iso_datetime(value: Any) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(raw)
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
+
+
+def _mark_worker_heartbeat(name: str, state: str) -> None:
+    with _RUNTIME_STATE_LOCK:
+        worker_heartbeats = _RUNTIME_STATE.setdefault("worker_heartbeats", {})
+        worker_heartbeats[str(name)] = {
+            "at": _utcnow_iso(),
+            "state": str(state or "").strip(),
+        }
+
+
+def _record_runtime_action(action_type: str, message: str, **details: Any) -> dict[str, Any]:
+    entry: dict[str, Any] = {
+        "at": _utcnow_iso(),
+        "type": str(action_type or "event").strip() or "event",
+        "message": str(message or "").strip(),
+    }
+    for key, value in details.items():
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        entry[key] = value
+
+    with _RUNTIME_STATE_LOCK:
+        actions = _RUNTIME_STATE.setdefault("last_actions", [])
+        actions.append(entry)
+        if len(actions) > WATCHDOG_ACTION_HISTORY_LIMIT:
+            del actions[:-WATCHDOG_ACTION_HISTORY_LIMIT]
+    return entry
+
+
+def _runtime_snapshot() -> dict[str, Any]:
+    with _RUNTIME_STATE_LOCK:
+        return {
+            "worker_heartbeats": json.loads(json.dumps(_RUNTIME_STATE.get("worker_heartbeats", {}))),
+            "last_actions": json.loads(json.dumps(_RUNTIME_STATE.get("last_actions", []))),
+        }
+
+
+def _notify_watchdog(cfg: Config, notification_key: str, text: str) -> bool:
+    key = str(notification_key or "watchdog").strip() or "watchdog"
+    now_ts = time.time()
+    with _RUNTIME_STATE_LOCK:
+        last_notifications = _RUNTIME_STATE.setdefault("last_notifications", {})
+        last_sent = float(last_notifications.get(key, 0.0) or 0.0)
+        if now_ts - last_sent < WATCHDOG_NOTIFY_MIN_INTERVAL_SECONDS:
+            return False
+        last_notifications[key] = now_ts
+
+    try:
+        token, chat_id = _resolve_telegram_config(cfg)
+        if not token or not chat_id:
+            return False
+        _send_telegram_message(token, chat_id, text)
+        return True
+    except Exception as exc:
+        LOG.warning("watchdog telegram notify failed key=%s err=%s", key, exc)
+        return False
+
+
+def _fetch_newsletter_status_page(
+    cfg: Config,
+    status: str,
+    *,
+    limit: int = 5,
+    mode: str = "oldest",
+) -> dict[str, Any]:
+    payload = _api_get(cfg, "newsletter/pending/", {"status": status, "limit": limit, "mode": mode})
+    if not isinstance(payload, dict):
+        payload = {}
+    rows = payload.get("newsletters", [])
+    if not isinstance(rows, list):
+        rows = []
+    payload["newsletters"] = [row for row in rows if isinstance(row, dict)]
+    payload.setdefault("pending_count", len(payload["newsletters"]))
+    return payload
+
+
+def _summarize_newsletter_row(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": row.get("id"),
+        "gmail_uid": row.get("gmail_uid"),
+        "subject": str(row.get("subject", "")).strip(),
+        "status": str(row.get("status", "")).strip(),
+        "received_at": str(row.get("received_at", "")).strip(),
+        "original_sent_at": str(row.get("original_sent_at", "")).strip(),
+        "sender_email": str(row.get("sender_email", "")).strip(),
+    }
+
+
+def _summarize_active_article(article: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(article, dict) or not article:
+        return None
+    return {
+        "id": article.get("id"),
+        "newsletter_id": article.get("newsletter_id"),
+        "title": str(article.get("title", "")).strip(),
+        "content_profile": str(article.get("content_profile", "")).strip(),
+        "telegram_triage_status": str(article.get("telegram_triage_status", "")).strip(),
+        "original_url": str(article.get("original_url", "")).strip(),
+    }
+
+
+def _observe_pipeline_state(cfg: Config) -> dict[str, Any]:
+    observed_at = _utcnow_iso()
+    statuses = ("pending", "processing", "review", "completed", "error")
+    counts: dict[str, int] = {}
+    current: dict[str, list[dict[str, Any]]] = {}
+    for status in statuses:
+        payload = _fetch_newsletter_status_page(cfg, status, limit=5, mode="oldest")
+        counts[status] = int(payload.get("pending_count", 0) or 0)
+        current[status] = [_summarize_newsletter_row(row) for row in payload.get("newsletters", [])]
+
+    article_payload = _api_get(
+        cfg,
+        "articles/editorial-pending/",
+        {"mode": "oldest", "exclude_tg_triaged": "true"},
+    )
+    article_status = str(article_payload.get("status", "")).strip() if isinstance(article_payload, dict) else ""
+    article_reason = str(article_payload.get("reason", "")).strip() if isinstance(article_payload, dict) else ""
+    active_article = None
+    if isinstance(article_payload, dict):
+        active_article = _summarize_active_article(article_payload.get("article"))
+
+    disk_root = Path(cfg.review_output_dir)
+    try:
+        disk_usage = shutil.disk_usage(disk_root)
+        free_pct = round((disk_usage.free / disk_usage.total) * 100, 2) if disk_usage.total else 0.0
+    except Exception:
+        free_pct = None
+
+    return {
+        "observed_at": observed_at,
+        "counts": counts,
+        "current": current,
+        "active_article": active_article,
+        "editorial_queue": {
+            "status": article_status,
+            "reason": article_reason,
+        },
+        "health": {
+            "review_api_ok": True,
+            "disk_free_pct": free_pct,
+        },
+    }
+
+
+def _write_watchdog_status(cfg: Config, payload: dict[str, Any]) -> None:
+    path = _watchdog_status_path(cfg)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _update_stuck_tracker(
+    tracker: dict[str, dict[str, Any] | None],
+    status: str,
+    rows: list[dict[str, Any]],
+    now_ts: float,
+) -> tuple[dict[str, Any] | None, float]:
+    row = rows[0] if rows else None
+    if not isinstance(row, dict) or not row.get("id"):
+        tracker[status] = None
+        return None, 0.0
+
+    newsletter_id = int(row.get("id") or 0)
+    current = tracker.get(status)
+    if current and int(current.get("newsletter_id") or 0) == newsletter_id:
+        age_seconds = max(0.0, now_ts - float(current.get("first_seen_ts") or now_ts))
+        return row, age_seconds
+
+    tracker[status] = {
+        "newsletter_id": newsletter_id,
+        "first_seen_ts": now_ts,
+    }
+    return row, 0.0
+
+
+def _sync_labels_after_step(cfg: Config, result: dict[str, Any]) -> None:
+    status = str(result.get("status", "")).strip()
+    if status == "processed":
+        _sync_status_gmail_labels(cfg, status="completed", mode="oldest", limit=100)
+    elif status in {"review", "blocked_review"}:
+        _sync_status_gmail_labels(cfg, status="review", mode="oldest", limit=1)
+
+
+def _recover_pending_with_fresh_imap(
+    cfg: Config,
+    gmail_address: str,
+    gmail_app_password: str,
+) -> dict[str, Any]:
+    mail: imaplib.IMAP4_SSL | None = None
+    try:
+        mail = connect_gmail(gmail_address, gmail_app_password)
+        result = process_next_pending(cfg, mail=mail)
+        _sync_labels_after_step(cfg, result)
+        return result
+    finally:
+        _safe_logout(mail)
+
+
+def _format_watchdog_event(title: str, lines: list[str]) -> str:
+    body = [title]
+    body.extend(line for line in lines if str(line or "").strip())
+    return "\n".join(body)
+
+
+def _pipeline_watchdog_worker(
+    stop_event: threading.Event,
+    cfg: Config,
+    gmail_address: str,
+    gmail_app_password: str,
+) -> None:
+    tracker: dict[str, dict[str, Any] | None] = {
+        "pending": None,
+        "processing": None,
+    }
+    _record_runtime_action("watchdog_started", "Pipeline watchdog started")
+    _notify_watchdog(cfg, "watchdog_started", "Watchdog ativo: monitorizacao e recuperacao segura ligadas.")
+
+    while not stop_event.is_set():
+        _mark_worker_heartbeat("watchdog", "observe")
+        blockers: list[dict[str, Any]] = []
+        try:
+            recovery = _recover_review_gate_startup(cfg)
+            if any(int(recovery.get(key, 0) or 0) for key in ("requeued_pending", "completed", "renotified", "errors")):
+                action = _record_runtime_action("review_recovery", "Recovered review gate state", recovery=recovery)
+                _notify_watchdog(
+                    cfg,
+                    f"review_recovery:{action['at']}",
+                    _format_watchdog_event(
+                        "Watchdog: recovery on review gate",
+                        [
+                            f"requeued_pending={recovery.get('requeued_pending', 0)}",
+                            f"completed={recovery.get('completed', 0)}",
+                            f"renotified={recovery.get('renotified', 0)}",
+                            f"errors={recovery.get('errors', 0)}",
+                        ],
+                    ),
+                )
+
+            observed = _observe_pipeline_state(cfg)
+            now_ts = time.time()
+
+            pending_row, pending_age = _update_stuck_tracker(tracker, "pending", observed["current"].get("pending", []), now_ts)
+            processing_row, processing_age = _update_stuck_tracker(tracker, "processing", observed["current"].get("processing", []), now_ts)
+
+            disk_free_pct = observed.get("health", {}).get("disk_free_pct")
+            if isinstance(disk_free_pct, (int, float)) and disk_free_pct <= WATCHDOG_DISK_FREE_ALERT_PCT:
+                blockers.append({
+                    "type": "disk_low",
+                    "free_pct": disk_free_pct,
+                })
+                _notify_watchdog(
+                    cfg,
+                    "disk_low",
+                    _format_watchdog_event("Watchdog: low disk space", [f"free_pct={disk_free_pct}"]),
+                )
+
+            if (
+                pending_row
+                and not observed["current"].get("processing")
+                and not observed["current"].get("review")
+                and pending_age >= WATCHDOG_PENDING_STUCK_SECONDS
+            ):
+                blocker = {
+                    "type": "pending_stuck",
+                    "newsletter_id": pending_row.get("id"),
+                    "gmail_uid": pending_row.get("gmail_uid"),
+                    "subject": pending_row.get("subject"),
+                    "age_seconds": round(pending_age, 1),
+                }
+                blockers.append(blocker)
+                result = _recover_pending_with_fresh_imap(cfg, gmail_address, gmail_app_password)
+                action = _record_runtime_action(
+                    "pending_recovery",
+                    "Recovered stuck pending newsletter with fresh IMAP session",
+                    newsletter_id=pending_row.get("id"),
+                    gmail_uid=pending_row.get("gmail_uid"),
+                    result=result,
+                )
+                _notify_watchdog(
+                    cfg,
+                    f"pending_recovery:{pending_row.get('id')}:{result.get('status')}",
+                    _format_watchdog_event(
+                        "Watchdog: pending newsletter recovered",
+                        [
+                            f"newsletter_id={pending_row.get('id')} uid={pending_row.get('gmail_uid')}",
+                            f"subject={pending_row.get('subject', '')}",
+                            f"action=process_next_pending_fresh_imap",
+                            f"result={result.get('status')}",
+                        ],
+                    ),
+                )
+                observed = _observe_pipeline_state(cfg)
+                tracker["pending"] = None
+
+            if processing_row and processing_age >= WATCHDOG_PROCESSING_STUCK_SECONDS:
+                blocker = {
+                    "type": "processing_stuck",
+                    "newsletter_id": processing_row.get("id"),
+                    "gmail_uid": processing_row.get("gmail_uid"),
+                    "subject": processing_row.get("subject"),
+                    "age_seconds": round(processing_age, 1),
+                }
+                blockers.append(blocker)
+                if not _PROCESS_NEXT_PENDING_LOCK.locked():
+                    _api_post(
+                        cfg,
+                        "newsletter/status/",
+                        {
+                            "newsletter_id": int(processing_row.get("id") or 0),
+                            "status": "pending",
+                            "error_message": f"Auto-recovered by watchdog after {int(processing_age)}s stuck in processing.",
+                        },
+                    )
+                    action = _record_runtime_action(
+                        "processing_requeue",
+                        "Requeued stuck processing newsletter",
+                        newsletter_id=processing_row.get("id"),
+                        gmail_uid=processing_row.get("gmail_uid"),
+                        age_seconds=round(processing_age, 1),
+                    )
+                    _notify_watchdog(
+                        cfg,
+                        f"processing_requeue:{processing_row.get('id')}",
+                        _format_watchdog_event(
+                            "Watchdog: processing newsletter requeued",
+                            [
+                                f"newsletter_id={processing_row.get('id')} uid={processing_row.get('gmail_uid')}",
+                                f"subject={processing_row.get('subject', '')}",
+                                f"action=requeue_to_pending",
+                            ],
+                        ),
+                    )
+                    observed = _observe_pipeline_state(cfg)
+                    tracker["processing"] = None
+                else:
+                    blocker["action"] = "waiting_active_processing_lock"
+                    _notify_watchdog(
+                        cfg,
+                        f"processing_lock:{processing_row.get('id')}",
+                        _format_watchdog_event(
+                            "Watchdog: processing appears blocked but still active",
+                            [
+                                f"newsletter_id={processing_row.get('id')} uid={processing_row.get('gmail_uid')}",
+                                f"subject={processing_row.get('subject', '')}",
+                                "action=none_safe_lock_active",
+                            ],
+                        ),
+                    )
+
+            payload = {
+                **observed,
+                "blockers": blockers,
+                "runtime": _runtime_snapshot(),
+            }
+            _write_watchdog_status(cfg, payload)
+        except Exception as exc:
+            LOG.exception("pipeline watchdog cycle failed")
+            failure_payload = {
+                "observed_at": _utcnow_iso(),
+                "counts": {},
+                "current": {},
+                "active_article": None,
+                "editorial_queue": {
+                    "status": "error",
+                    "reason": str(exc),
+                },
+                "blockers": [{
+                    "type": "watchdog_error",
+                    "message": str(exc),
+                }],
+                "runtime": _runtime_snapshot(),
+                "health": {
+                    "review_api_ok": False,
+                },
+            }
+            _record_runtime_action("watchdog_error", "Watchdog cycle failed", error=str(exc))
+            try:
+                _write_watchdog_status(cfg, failure_payload)
+            except Exception:
+                pass
+            _notify_watchdog(
+                cfg,
+                "watchdog_error",
+                _format_watchdog_event("Watchdog: cycle failed", [f"error={exc}"]),
+            )
+
+        _sleep_with_stop(stop_event, WATCHDOG_INTERVAL_SECONDS)
 
 def _setup_debug_breakpoint_on_start() -> None:
     if not _is_truthy(os.getenv("DEBUGPY_ENABLE")):
@@ -1268,7 +1725,7 @@ def _hydrate_newsletter_raw_html(
     return refreshed
 
 
-def process_next_pending(cfg: Config, mail: imaplib.IMAP4_SSL | None = None) -> dict[str, Any]:
+def _process_next_pending_unlocked(cfg: Config, mail: imaplib.IMAP4_SSL | None = None) -> dict[str, Any]:
     if _has_review_pending(cfg):
         return {"status": "blocked_review"}
 
@@ -1372,6 +1829,12 @@ def process_next_pending(cfg: Config, mail: imaplib.IMAP4_SSL | None = None) -> 
     }
 
 
+def process_next_pending(cfg: Config, mail: imaplib.IMAP4_SSL | None = None) -> dict[str, Any]:
+    with _PROCESS_NEXT_PENDING_LOCK:
+        _mark_worker_heartbeat("process", "process_next_pending")
+        return _process_next_pending_unlocked(cfg, mail=mail)
+
+
 def run_backlog_mode(mail: imaplib.IMAP4_SSL, cfg: Config) -> None:
     if not _has_active_newsletter_work(cfg):
         try:
@@ -1426,6 +1889,7 @@ def run_monitor_mode(mail: imaplib.IMAP4_SSL, cfg: Config) -> None:
                     _sync_status_gmail_labels(cfg, status="completed", mode="oldest", limit=100)
                 except Exception as exc:
                     LOG.warning("gmail label sync failed before monitor ingest err=%s", exc)
+                _mark_worker_heartbeat("ingest", "ingest_inbox")
                 stats = ingest_inbox(mail, cfg, limit=1)
             LOG.info(
                 "ingest stats: scanned=%s created=%s duplicate=%s failed=%s",
@@ -1435,8 +1899,9 @@ def run_monitor_mode(mail: imaplib.IMAP4_SSL, cfg: Config) -> None:
                 stats["failed"],
             )
 
-            # Drena pending até ficar bloqueado por review ou sem trabalho.
+            # Drena pending ate ficar bloqueado por review ou sem trabalho.
             while True:
+                _mark_worker_heartbeat("process", "process_pending")
                 step = process_next_pending(cfg, mail=mail)
                 status = step.get("status")
                 if status == "processed":
@@ -1494,6 +1959,7 @@ def _parallel_ingest_worker(
 ) -> None:
     mail: imaplib.IMAP4_SSL | None = None
     while not stop_event.is_set():
+        _mark_worker_heartbeat("ingest", "loop")
         if mail is None:
             try:
                 mail = connect_gmail(gmail_address, gmail_app_password)
@@ -1508,6 +1974,7 @@ def _parallel_ingest_worker(
 
         try:
             if _has_active_newsletter_work(cfg):
+                _mark_worker_heartbeat("ingest", "gated_active_work")
                 _sleep_with_stop(stop_event, REVIEW_GATING_SLEEP_SECONDS)
                 continue
             try:
@@ -1553,10 +2020,12 @@ def _parallel_process_worker(
 ) -> None:
     mail: imaplib.IMAP4_SSL | None = None
     while not stop_event.is_set():
+        _mark_worker_heartbeat("process", "loop")
         try:
             if _has_review_pending(cfg):
                 if mail is None:
                     mail = connect_gmail(gmail_address, gmail_app_password)
+                _mark_worker_heartbeat("process", "review_wait")
                 try:
                     _sync_status_gmail_labels(cfg, status="review", mode="oldest", limit=1)
                 except Exception as exc:
@@ -1565,6 +2034,7 @@ def _parallel_process_worker(
                 continue
 
             if not _fetch_next_pending(cfg):
+                _mark_worker_heartbeat("process", "idle")
                 try:
                     _sync_status_gmail_labels(cfg, status="completed", mode="oldest", limit=100)
                 except Exception as exc:
@@ -1575,6 +2045,7 @@ def _parallel_process_worker(
             if mail is None:
                 mail = connect_gmail(gmail_address, gmail_app_password)
 
+            _mark_worker_heartbeat("process", "process_pending")
             step = process_next_pending(cfg, mail=mail)
             status = step.get("status")
 
@@ -1633,29 +2104,29 @@ def cleanup_zombie_tasks():
     )
     os.system(cmd)
 
-def run_monitor_parallel_mode(cfg: Config, gmail_address: str, gmail_app_password: str) -> None:
-    
-    cleanup_zombie_tasks()
-    start_review_api_server()
-
-    # --- Telegram bot with inline buttons (migrated from local agent, Fase 4) ---
-    telegram_bot_thread = None
-    telegram_bot_active = False
+def _start_telegram_bot_thread(cfg: Config) -> tuple[threading.Thread | None, bool]:
     try:
         from telegram_bot import run_telegram_bot_thread, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+
         if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-            telegram_bot_thread = run_telegram_bot_thread(cfg)
-            telegram_bot_active = True
+            thread = run_telegram_bot_thread(cfg)
             LOG.info("telegram bot thread started")
-        else:
-            LOG.info("telegram bot disabled (TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set)")
+            return thread, True
+        LOG.info("telegram bot disabled (TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set)")
     except ImportError:
         LOG.warning("telegram_bot module not available; inline button UX disabled")
     except Exception as exc:
         LOG.warning("telegram bot startup failed: %s", exc)
+    return None, False
 
-    # When the inline-button bot is active, disable the old plain-text notification
-    # system to avoid duplicate messages for the same articles.
+
+def run_monitor_parallel_mode(cfg: Config, gmail_address: str, gmail_app_password: str) -> None:
+    _refresh_watchdog_settings()
+    cleanup_zombie_tasks()
+    start_review_api_server()
+
+    telegram_bot_thread, telegram_bot_active = _start_telegram_bot_thread(cfg)
+
     if telegram_bot_active:
         global REVIEW_TELEGRAM_NOTIFY
         REVIEW_TELEGRAM_NOTIFY = False
@@ -1664,7 +2135,7 @@ def run_monitor_parallel_mode(cfg: Config, gmail_address: str, gmail_app_passwor
     recovery = _recover_review_gate_startup(cfg)
     if any(recovery.get(key, 0) for key in ("requeued_pending", "completed", "renotified", "errors")):
         LOG.info("startup review recovery stats=%s", recovery)
-    
+
     stop_event = threading.Event()
     ingest_thread = threading.Thread(
         target=_parallel_ingest_worker,
@@ -1678,28 +2149,48 @@ def run_monitor_parallel_mode(cfg: Config, gmail_address: str, gmail_app_passwor
         args=(stop_event, cfg, gmail_address, gmail_app_password),
         daemon=True,
     )
+    watchdog_thread = None
+    if WATCHDOG_ENABLED:
+        watchdog_thread = threading.Thread(
+            target=_pipeline_watchdog_worker,
+            name="pipeline-watchdog",
+            args=(stop_event, cfg, gmail_address, gmail_app_password),
+            daemon=True,
+        )
     ingest_thread.start()
     process_thread.start()
+    if watchdog_thread:
+        watchdog_thread.start()
 
     try:
         while True:
+            _mark_worker_heartbeat("main", "heartbeat")
             if not ingest_thread.is_alive():
                 raise RuntimeError("ingest worker stopped unexpectedly")
             if not process_thread.is_alive():
                 raise RuntimeError("process worker stopped unexpectedly")
-            if telegram_bot_thread and not telegram_bot_thread.is_alive():
-                LOG.warning("telegram bot thread died; inline button UX unavailable")
-                telegram_bot_thread = None
+            if watchdog_thread and not watchdog_thread.is_alive():
+                raise RuntimeError("pipeline watchdog stopped unexpectedly")
+            if telegram_bot_active and telegram_bot_thread and not telegram_bot_thread.is_alive():
+                LOG.warning("telegram bot thread died; restarting")
+                _record_runtime_action("telegram_bot_restart", "Telegram bot thread restarted")
+                telegram_bot_thread, telegram_bot_active = _start_telegram_bot_thread(cfg)
+                if telegram_bot_active:
+                    REVIEW_TELEGRAM_NOTIFY = False
             time.sleep(PARALLEL_MAIN_HEARTBEAT_SECONDS)
     except KeyboardInterrupt:
         stop_event.set()
         ingest_thread.join(timeout=5)
         process_thread.join(timeout=5)
+        if watchdog_thread:
+            watchdog_thread.join(timeout=5)
         raise
     except Exception:
         stop_event.set()
         ingest_thread.join(timeout=5)
         process_thread.join(timeout=5)
+        if watchdog_thread:
+            watchdog_thread.join(timeout=5)
         raise
 
 

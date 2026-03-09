@@ -1,5 +1,6 @@
 import environ
 from pathlib import Path
+from urllib.parse import urlsplit
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -9,6 +10,36 @@ environ.Env.read_env(BASE_DIR.parent / ".env")
 SECRET_KEY = env("DJANGO_SECRET_KEY", default="insecure-dev-key")
 DEBUG = env.bool("DJANGO_DEBUG", default=False)
 ALLOWED_HOSTS = env.list("DJANGO_ALLOWED_HOSTS", default=["localhost", "127.0.0.1"])
+PORTAL_PUBLIC_BASE_URL = env("PORTAL_PUBLIC_BASE_URL", default="").strip().rstrip("/")
+CSRF_TRUSTED_ORIGINS = env.list("DJANGO_CSRF_TRUSTED_ORIGINS", default=[])
+
+
+def _append_csrf_origin(origin: str) -> None:
+    value = str(origin or "").strip().rstrip("/")
+    if value and value not in CSRF_TRUSTED_ORIGINS:
+        CSRF_TRUSTED_ORIGINS.append(value)
+
+
+for host in ALLOWED_HOSTS:
+    candidate = str(host or "").strip()
+    if not candidate:
+        continue
+    if candidate.startswith("."):
+        _append_csrf_origin(f"https://*{candidate}")
+        _append_csrf_origin(f"http://*{candidate}")
+    else:
+        _append_csrf_origin(f"https://{candidate}")
+        _append_csrf_origin(f"http://{candidate}")
+
+if PORTAL_PUBLIC_BASE_URL:
+    parts = urlsplit(PORTAL_PUBLIC_BASE_URL)
+    if parts.scheme and parts.netloc:
+        _append_csrf_origin(f"{parts.scheme}://{parts.netloc}")
+        if parts.hostname and parts.hostname not in ALLOWED_HOSTS:
+            ALLOWED_HOSTS.append(parts.hostname)
+
+USE_X_FORWARDED_HOST = True
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 
 INSTALLED_APPS = [
     "django.contrib.admin",

@@ -134,18 +134,40 @@ def _read_source_text(source_text: str, source_text_file: str, read_stdin: bool)
     return ""
 
 
+def _fallback_revision_source_text(article: dict, *, max_chars: int) -> str:
+    parts: list[str] = []
+    for key in ("title", "summary", "article_body"):
+        value = str(article.get(key, "")).strip()
+        if value:
+            parts.append(value)
+    categories = [str(c).strip() for c in article.get("categories", []) if str(c).strip()]
+    if categories:
+        parts.append("Categories: " + ", ".join(categories))
+    for key in ("section", "category", "subcategory"):
+        value = str(article.get(key, "")).strip()
+        if value:
+            parts.append(f"{key}: {value}")
+    combined = "\n\n".join(part for part in parts if part)
+    return combined[:max_chars].strip()
+
+
 def _build_revision_payload(cfg: Config, article: dict, instructions: str, source_text_override: str, max_source_chars: int) -> dict:
     source_url = str(article.get("original_url", "")).strip()
     source_text = source_text_override.strip()
     if not source_text and source_url:
         snapshot = _get_source_snapshot(source_url, max_source_chars, max(120, cfg.source_open_min_chars))
         source_text = str(snapshot.get("text", "")).strip()
-    if not source_text:
-        source_text = str(article.get("article_body", "")).strip() or str(article.get("summary", "")).strip()
+    if len(source_text) < 300:
+        fallback_text = _fallback_revision_source_text(article, max_chars=max_source_chars)
+        if len(fallback_text) > len(source_text):
+            source_text = fallback_text
     source_text = source_text[:max_source_chars]
 
-    if len(source_text) < 300:
-        raise SystemExit("source text too short for revision (need >=300 chars). Provide full text via --source-text/file/stdin.")
+    if len(source_text) < 180:
+        raise SystemExit(
+            "source text too short for revision even after preview fallback (need >=180 chars). "
+            "Provide full text via --source-text/file/stdin."
+        )
 
     _assert_required_summary_model(cfg)
     prompt = REVISION_PROMPT.format(

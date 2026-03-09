@@ -213,13 +213,15 @@ services:
       REVIEW_NEXT_NOTIFICATION_DELAY_SECONDS: "15"
       SOURCE_REWRITE_ENABLED: "true"
       SOURCE_REWRITE_MAX_CHARS: "12000"
-      PARALLEL_INGEST_BATCH_SIZE: "5"
+      PARALLEL_INGEST_BATCH_SIZE: "1"
       ALLOWED_FORWARDER_EMAILS: carlos.santos@plutoanalytics.com
-      GMAIL_EXCLUDED_LABELS: ""
+      GMAIL_EXCLUDED_LABELS: "Pending,Published,Partial,Rejected"
       # --- Telegram bot with inline buttons (Fase 4) ---
       TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN}"
       TELEGRAM_CHAT_ID: "${TELEGRAM_CHAT_ID}"
       PORTAL_PUBLIC_BASE_URL: "${PORTAL_PUBLIC_BASE_URL:-}"
+      TELEGRAM_TRIAGE_NEWSLETTER_ID: "${TELEGRAM_TRIAGE_NEWSLETTER_ID:-}"
+      CLOUDFLARED_CONTAINER_NAME: "${CLOUDFLARED_CONTAINER_NAME:-ainews-cloudflared}"
       TELEGRAM_TRIAGE_INTERVAL: "15"
       # --- Per-task model configuration (Fase 6) ---
       OLLAMA_MODEL_SUMMARY: "${OLLAMA_MODEL_SUMMARY:-qwen3:14b}"

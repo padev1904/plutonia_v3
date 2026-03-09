@@ -28,23 +28,22 @@ from pathlib import Path
 from typing import Any
 from process_newsletter import Config, process_single_newsletter
 from review_api import start_review_api_server
-from review_api import start_review_api_server
 
 LOG = logging.getLogger("gmail_monitor")
 
 INGEST_INTERVAL_SECONDS = int(os.getenv("INGEST_INTERVAL_SECONDS", "60"))
-INGEST_MAX_NEW_PER_CYCLE = int(os.getenv("INGEST_MAX_NEW_PER_CYCLE", "200"))
+INGEST_MAX_NEW_PER_CYCLE = int(os.getenv("INGEST_MAX_NEW_PER_CYCLE", "1"))
 REVIEW_GATING_SLEEP_SECONDS = int(os.getenv("REVIEW_GATING_SLEEP_SECONDS", "30"))
 IMAP_RECONNECT_SECONDS = int(os.getenv("IMAP_RECONNECT_SECONDS", "15"))
 IMAP_OVERQUOTA_SLEEP_SECONDS = int(os.getenv("IMAP_OVERQUOTA_SLEEP_SECONDS", "180"))
 MIN_RAW_HTML_PROCESS_CHARS = int(os.getenv("MIN_RAW_HTML_PROCESS_CHARS", "200"))
-PARALLEL_INGEST_BATCH_SIZE = int(os.getenv("PARALLEL_INGEST_BATCH_SIZE", "25"))
+PARALLEL_INGEST_BATCH_SIZE = int(os.getenv("PARALLEL_INGEST_BATCH_SIZE", "1"))
 PARALLEL_INGEST_ACTIVE_SLEEP_SECONDS = int(os.getenv("PARALLEL_INGEST_ACTIVE_SLEEP_SECONDS", "2"))
 PARALLEL_PROCESS_IDLE_SLEEP_SECONDS = int(os.getenv("PARALLEL_PROCESS_IDLE_SLEEP_SECONDS", "3"))
 PARALLEL_MAIN_HEARTBEAT_SECONDS = int(os.getenv("PARALLEL_MAIN_HEARTBEAT_SECONDS", "5"))
 GMAIL_EXCLUDED_LABELS = [
     item.strip()
-    for item in os.getenv("GMAIL_EXCLUDED_LABELS", "Pending,Published").split(",")
+    for item in os.getenv("GMAIL_EXCLUDED_LABELS", "Pending,Published,Partial,Rejected").split(",")
     if item.strip()
 ]
 ALLOWED_FORWARDER_EMAILS = [
@@ -61,6 +60,9 @@ REVIEW_TELEGRAM_NOTIFY = os.getenv("REVIEW_TELEGRAM_NOTIFY", "true").strip().low
 REVIEW_TELEGRAM_BOT_TOKEN = os.getenv("REVIEW_TELEGRAM_BOT_TOKEN", "").strip()
 REVIEW_TELEGRAM_CHAT_ID = os.getenv("REVIEW_TELEGRAM_CHAT_ID", "").strip()
 OPENCLAW_CONFIG_PATH = os.getenv("OPENCLAW_CONFIG_PATH", "/home/python/.openclaw/openclaw.json")
+
+MANAGED_GMAIL_LABELS = ("Pending", "Published", "Partial", "Rejected")
+MANAGED_GMAIL_LABEL_KEYS = {label.casefold() for label in MANAGED_GMAIL_LABELS}
 
 # Cache apenas resultados válidos; tentativas falhadas devem voltar a resolver no ciclo seguinte.
 _TELEGRAM_CONFIG_CACHE: tuple[str, str] | None = None
@@ -153,18 +155,11 @@ def _parse_x_gm_labels(fetch_text: str) -> set[str]:
     return out
 
 
-def _uid_has_excluded_label(
-    mail: imaplib.IMAP4_SSL,
-    uid: bytes,
-    *,
-    excluded_labels: set[str],
-) -> bool:
-    if not excluded_labels:
-        return False
+def _fetch_uid_labels(mail: imaplib.IMAP4_SSL, uid: bytes) -> set[str]:
     status, data = mail.uid("FETCH", uid, "(X-GM-LABELS)")
     if status != "OK" or not data:
         LOG.warning("uid label fetch failed uid=%s status=%s", uid.decode(errors="ignore"), status)
-        return False
+        return set()
 
     labels: set[str] = set()
     for row in data:
@@ -174,8 +169,76 @@ def _uid_has_excluded_label(
                     labels |= _parse_x_gm_labels(part.decode("utf-8", errors="replace"))
         elif isinstance(row, (bytes, bytearray)):
             labels |= _parse_x_gm_labels(bytes(row).decode("utf-8", errors="replace"))
+    return labels
 
+
+def _uid_has_excluded_label(
+    mail: imaplib.IMAP4_SSL,
+    uid: bytes,
+    *,
+    excluded_labels: set[str],
+) -> bool:
+    if not excluded_labels:
+        return False
+    labels = _fetch_uid_labels(mail, uid)
     return bool(labels & excluded_labels)
+
+
+def _imap_label_expr(labels: list[str]) -> str:
+    escaped_labels: list[str] = []
+    for label in labels:
+        value = str(label or "").strip()
+        if not value:
+            continue
+        value = value.replace("\\", "\\\\").replace('"', '\\"')
+        escaped_labels.append(f'"{value}"')
+    return "(" + " ".join(escaped_labels) + ")"
+
+
+def _ensure_gmail_label(mail: imaplib.IMAP4_SSL, label: str) -> None:
+    value = str(label or "").strip()
+    if not value:
+        return
+    try:
+        mail.create(value)
+    except Exception:
+        return
+
+
+def _apply_managed_gmail_label(mail: imaplib.IMAP4_SSL, uid: bytes, target_label: str) -> dict[str, Any]:
+    target_value = str(target_label or "").strip()
+    target_norm = _normalize_gmail_label(target_value) if target_value else ""
+    current_labels = _fetch_uid_labels(mail, uid)
+    current_norms = {_normalize_gmail_label(label) for label in current_labels}
+
+    labels_to_remove = [
+        label
+        for label in MANAGED_GMAIL_LABELS
+        if _normalize_gmail_label(label) in current_norms and _normalize_gmail_label(label) != target_norm
+    ]
+    labels_to_add = []
+    if target_value and target_norm not in current_norms:
+        labels_to_add.append(target_value)
+
+    if labels_to_remove:
+        status, _ = mail.uid("STORE", uid, "-X-GM-LABELS", _imap_label_expr(labels_to_remove))
+        if status != "OK":
+            raise RuntimeError(f"failed to remove gmail labels uid={uid.decode(errors='ignore')} labels={labels_to_remove}")
+
+    if labels_to_add:
+        for label in labels_to_add:
+            _ensure_gmail_label(mail, label)
+        status, _ = mail.uid("STORE", uid, "+X-GM-LABELS", _imap_label_expr(labels_to_add))
+        if status != "OK":
+            raise RuntimeError(f"failed to add gmail labels uid={uid.decode(errors='ignore')} labels={labels_to_add}")
+
+    return {
+        "current_labels": sorted(current_labels),
+        "target_label": target_value,
+        "labels_removed": labels_to_remove,
+        "labels_added": labels_to_add,
+        "changed": bool(labels_to_remove or labels_to_add),
+    }
 
 
 def _normalize_datetime(value: str) -> str:
@@ -267,6 +330,14 @@ def _get_best_html(msg: Message) -> str:
         plain = "\n\n".join(text_parts)
         return f"<html><body><pre>{plain}</pre></body></html>"
     return ""
+
+
+def _looks_like_plaintext_wrapper_html(value: str) -> bool:
+    html = (value or "").strip().lower()
+    if not html:
+        return False
+    compact = re.sub(r"\s+", "", html)
+    return compact.startswith("<html><body><pre>") and compact.endswith("</pre></body></html>")
 
 
 def _extract_forwarded_message(msg: Message) -> Message | None:
@@ -445,7 +516,12 @@ def extract_email_data(mail: imaplib.IMAP4_SSL, uid: bytes) -> dict[str, Any]:
     original_sent_at_raw = original_msg.get("Date", "")
     original_sent_at = _normalize_datetime(original_sent_at_raw)
 
-    raw_html = _get_best_html(original_msg) or _get_best_html(msg)
+    original_html = _get_best_html(original_msg)
+    parent_html = _get_best_html(msg)
+    if nested and _looks_like_plaintext_wrapper_html(original_html) and parent_html:
+        raw_html = parent_html
+    else:
+        raw_html = original_html or parent_html
 
     return {
         "gmail_uid": uid.decode(),
@@ -867,12 +943,159 @@ def _send_review_notification(
         LOG.warning("telegram review notification failed newsletter_id=%s err=%s", newsletter_id, exc)
 
 
-def _fetch_newsletters_by_status(cfg: Config, status: str, limit: int = 50) -> list[dict[str, Any]]:
-    payload = _api_get(cfg, "newsletter/pending/", {"status": status, "limit": limit})
+def _fetch_newsletters_by_status(
+    cfg: Config,
+    status: str,
+    limit: int = 50,
+    *,
+    mode: str = "oldest",
+) -> list[dict[str, Any]]:
+    payload = _api_get(cfg, "newsletter/pending/", {"status": status, "limit": limit, "mode": mode})
     rows = payload.get("newsletters", []) if isinstance(payload, dict) else []
     if not isinstance(rows, list):
         return []
     return [row for row in rows if isinstance(row, dict)]
+
+
+def _fetch_newsletter_workflow_state(cfg: Config, newsletter_id: int) -> dict[str, Any]:
+    payload = _api_get(cfg, f"newsletter/{newsletter_id}/workflow-state/")
+    newsletter = payload.get("newsletter", {}) if isinstance(payload, dict) else {}
+    return newsletter if isinstance(newsletter, dict) else {}
+
+
+def _has_active_newsletter_work(cfg: Config) -> bool:
+    for status in ("review", "processing", "pending"):
+        if _fetch_newsletters_by_status(cfg, status, limit=1):
+            return True
+    return False
+
+
+def _sync_newsletter_gmail_label(mail: imaplib.IMAP4_SSL, cfg: Config, newsletter_id: int) -> dict[str, Any]:
+    workflow = _fetch_newsletter_workflow_state(cfg, newsletter_id)
+    uid_raw = str(workflow.get("gmail_uid", "")).strip()
+    if not uid_raw:
+        return {"newsletter_id": newsletter_id, "changed": False, "reason": "missing_gmail_uid"}
+    sync_result = _apply_managed_gmail_label(mail, uid_raw.encode(), str(workflow.get("gmail_label", "")).strip())
+    sync_result["newsletter_id"] = newsletter_id
+    sync_result["gmail_uid"] = uid_raw
+    sync_result["workflow_status"] = str(workflow.get("status", "")).strip()
+    sync_result["workflow_label"] = str(workflow.get("gmail_label", "")).strip()
+    sync_result["subject"] = str(workflow.get("subject", "")).strip()
+    return sync_result
+
+
+def _sync_single_status_gmail_label(
+    mail: imaplib.IMAP4_SSL,
+    cfg: Config,
+    *,
+    status: str,
+    mode: str = "oldest",
+) -> dict[str, Any] | None:
+    summary = _sync_status_gmail_labels(cfg, status=status, limit=1, mode=mode)
+    rows = summary.get("results", []) if isinstance(summary, dict) else []
+    if not isinstance(rows, list) or not rows:
+        return None
+    first = rows[0]
+    return first if isinstance(first, dict) else None
+
+
+def _get_gmail_credentials() -> tuple[str, str]:
+    gmail_address = os.getenv("GMAIL_ADDRESS", "").strip()
+    gmail_app_password = os.getenv("GMAIL_APP_PASSWORD", "").strip()
+    if not gmail_address or not gmail_app_password:
+        raise RuntimeError("GMAIL_ADDRESS/GMAIL_APP_PASSWORD missing")
+    return gmail_address, gmail_app_password
+
+
+def _sync_status_gmail_labels(
+    cfg: Config,
+    *,
+    status: str,
+    mode: str = "oldest",
+    limit: int = 50,
+) -> dict[str, Any]:
+    rows = _fetch_newsletters_by_status(cfg, status, limit=limit, mode=mode)
+    if not rows:
+        return {
+            "status": status,
+            "mode": mode,
+            "newsletter_count": 0,
+            "synced": 0,
+            "changed": 0,
+            "results": [],
+            "errors": [],
+        }
+
+    gmail_address, gmail_app_password = _get_gmail_credentials()
+    mail: imaplib.IMAP4_SSL | None = None
+    results: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    synced = 0
+    changed = 0
+
+    def _connect() -> imaplib.IMAP4_SSL:
+        session = connect_gmail(gmail_address, gmail_app_password)
+        try:
+            status_sel, _ = session.select("INBOX")
+        except Exception:
+            _safe_logout(session)
+            raise
+        if status_sel != "OK":
+            _safe_logout(session)
+            raise RuntimeError(f"failed to select inbox for gmail label sync status={status_sel}")
+        return session
+
+    try:
+        mail = _connect()
+        for row in rows:
+            try:
+                newsletter_id = int(row.get("id") or 0)
+            except Exception:
+                newsletter_id = 0
+            if newsletter_id <= 0:
+                errors.append({"newsletter_id": row.get("id"), "error": "invalid_newsletter_id"})
+                continue
+
+            for attempt in range(2):
+                try:
+                    result = _sync_newsletter_gmail_label(mail, cfg, newsletter_id)
+                    results.append(result)
+                    synced += 1
+                    if bool(result.get("changed")):
+                        changed += 1
+                    break
+                except Exception as exc:
+                    last_attempt = attempt == 1
+                    if _is_imap_connection_error(exc) and not last_attempt:
+                        LOG.warning(
+                            "gmail label sync reconnect newsletter_id=%s status=%s err=%s",
+                            newsletter_id,
+                            status,
+                            exc,
+                        )
+                        _safe_logout(mail)
+                        mail = _connect()
+                        continue
+                    errors.append({"newsletter_id": newsletter_id, "error": str(exc)})
+                    LOG.warning(
+                        "gmail label sync failed newsletter_id=%s status=%s err=%s",
+                        newsletter_id,
+                        status,
+                        exc,
+                    )
+                    break
+    finally:
+        _safe_logout(mail)
+
+    return {
+        "status": status,
+        "mode": mode,
+        "newsletter_count": len(rows),
+        "synced": synced,
+        "changed": changed,
+        "results": results,
+        "errors": errors,
+    }
 
 
 def _review_draft_path(cfg: Config, newsletter_id: int) -> Path:
@@ -1150,7 +1373,14 @@ def process_next_pending(cfg: Config, mail: imaplib.IMAP4_SSL | None = None) -> 
 
 
 def run_backlog_mode(mail: imaplib.IMAP4_SSL, cfg: Config) -> None:
-    stats = ingest_inbox(mail, cfg)
+    if not _has_active_newsletter_work(cfg):
+        try:
+            _sync_status_gmail_labels(cfg, status="completed", mode="oldest", limit=100)
+        except Exception as exc:
+            LOG.warning("gmail label sync failed before backlog ingest err=%s", exc)
+        stats = ingest_inbox(mail, cfg, limit=1)
+    else:
+        stats = {"scanned": 0, "created": 0, "duplicate": 0, "failed": 0}
     LOG.info("ingest stats: scanned=%s created=%s duplicate=%s failed=%s", stats["scanned"], stats["created"], stats["duplicate"], stats["failed"])
 
     while True:
@@ -1158,14 +1388,26 @@ def run_backlog_mode(mail: imaplib.IMAP4_SSL, cfg: Config) -> None:
         status = step.get("status")
 
         if status == "processed":
+            try:
+                _sync_status_gmail_labels(cfg, status="completed", mode="oldest", limit=100)
+            except Exception as exc:
+                LOG.warning("gmail label sync failed after backlog processed err=%s", exc)
             continue
         if status == "review" or status == "blocked_review":
+            try:
+                _sync_status_gmail_labels(cfg, status="review", mode="oldest", limit=1)
+            except Exception as exc:
+                LOG.warning("gmail label sync failed during backlog review err=%s", exc)
             time.sleep(REVIEW_GATING_SLEEP_SECONDS)
             continue
         if status == "idle":
             if _has_review_pending(cfg):
                 time.sleep(REVIEW_GATING_SLEEP_SECONDS)
                 continue
+            try:
+                _sync_status_gmail_labels(cfg, status="completed", mode="oldest", limit=100)
+            except Exception as exc:
+                LOG.warning("gmail label sync failed at backlog completion err=%s", exc)
             LOG.info("backlog complete")
             return
 
@@ -1177,7 +1419,14 @@ def run_backlog_mode(mail: imaplib.IMAP4_SSL, cfg: Config) -> None:
 def run_monitor_mode(mail: imaplib.IMAP4_SSL, cfg: Config) -> None:
     while True:
         try:
-            stats = ingest_inbox(mail, cfg)
+            if _has_active_newsletter_work(cfg):
+                stats = {"scanned": 0, "created": 0, "duplicate": 0, "failed": 0}
+            else:
+                try:
+                    _sync_status_gmail_labels(cfg, status="completed", mode="oldest", limit=100)
+                except Exception as exc:
+                    LOG.warning("gmail label sync failed before monitor ingest err=%s", exc)
+                stats = ingest_inbox(mail, cfg, limit=1)
             LOG.info(
                 "ingest stats: scanned=%s created=%s duplicate=%s failed=%s",
                 stats["scanned"],
@@ -1191,8 +1440,22 @@ def run_monitor_mode(mail: imaplib.IMAP4_SSL, cfg: Config) -> None:
                 step = process_next_pending(cfg, mail=mail)
                 status = step.get("status")
                 if status == "processed":
+                    try:
+                        _sync_status_gmail_labels(cfg, status="completed", mode="oldest", limit=100)
+                    except Exception as exc:
+                        LOG.warning("gmail label sync failed after monitor processed err=%s", exc)
                     continue
                 if status in {"review", "blocked_review", "idle"}:
+                    if status in {"review", "blocked_review"}:
+                        try:
+                            _sync_status_gmail_labels(cfg, status="review", mode="oldest", limit=1)
+                        except Exception as exc:
+                            LOG.warning("gmail label sync failed during monitor review err=%s", exc)
+                    elif status == "idle":
+                        try:
+                            _sync_status_gmail_labels(cfg, status="completed", mode="oldest", limit=100)
+                        except Exception as exc:
+                            LOG.warning("gmail label sync failed during monitor idle err=%s", exc)
                     break
                 LOG.warning("monitor step status=%s details=%s", status, step)
                 break
@@ -1244,7 +1507,14 @@ def _parallel_ingest_worker(
                 continue
 
         try:
-            stats = ingest_inbox(mail, cfg, limit=PARALLEL_INGEST_BATCH_SIZE)
+            if _has_active_newsletter_work(cfg):
+                _sleep_with_stop(stop_event, REVIEW_GATING_SLEEP_SECONDS)
+                continue
+            try:
+                _sync_status_gmail_labels(cfg, status="completed", mode="oldest", limit=100)
+            except Exception as exc:
+                LOG.warning("parallel ingest: gmail label sync failed err=%s", exc)
+            stats = ingest_inbox(mail, cfg, limit=1)
             LOG.info(
                 "parallel ingest stats: scanned=%s created=%s duplicate=%s failed=%s",
                 stats["scanned"],
@@ -1285,10 +1555,20 @@ def _parallel_process_worker(
     while not stop_event.is_set():
         try:
             if _has_review_pending(cfg):
+                if mail is None:
+                    mail = connect_gmail(gmail_address, gmail_app_password)
+                try:
+                    _sync_status_gmail_labels(cfg, status="review", mode="oldest", limit=1)
+                except Exception as exc:
+                    LOG.warning("parallel process: gmail label sync failed err=%s", exc)
                 _sleep_with_stop(stop_event, REVIEW_GATING_SLEEP_SECONDS)
                 continue
 
             if not _fetch_next_pending(cfg):
+                try:
+                    _sync_status_gmail_labels(cfg, status="completed", mode="oldest", limit=100)
+                except Exception as exc:
+                    LOG.warning("parallel process: completed gmail label sync failed on idle err=%s", exc)
                 _sleep_with_stop(stop_event, PARALLEL_PROCESS_IDLE_SLEEP_SECONDS)
                 continue
 
@@ -1299,11 +1579,23 @@ def _parallel_process_worker(
             status = step.get("status")
 
             if status == "processed":
+                try:
+                    _sync_status_gmail_labels(cfg, status="completed", mode="oldest", limit=100)
+                except Exception as exc:
+                    LOG.warning("parallel process: completed gmail label sync failed after processed err=%s", exc)
                 continue
             if status in {"review", "blocked_review"}:
+                try:
+                    _sync_status_gmail_labels(cfg, status="review", mode="oldest", limit=1)
+                except Exception as exc:
+                    LOG.warning("parallel process: review gmail label sync failed after decision err=%s", exc)
                 _sleep_with_stop(stop_event, REVIEW_GATING_SLEEP_SECONDS)
                 continue
             if status == "idle":
+                try:
+                    _sync_status_gmail_labels(cfg, status="completed", mode="oldest", limit=100)
+                except Exception as exc:
+                    LOG.warning("parallel process: completed gmail label sync failed on idle status err=%s", exc)
                 _sleep_with_stop(stop_event, PARALLEL_PROCESS_IDLE_SLEEP_SECONDS)
                 continue
 

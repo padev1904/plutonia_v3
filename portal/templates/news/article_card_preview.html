@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block title %}Card preview · {{ article.title }}{% endblock %}
+{% block title %}Card preview | {{ article.title }}{% endblock %}
 {% block content %}
 <section class="mx-auto max-w-7xl">
   {% if is_preview %}
@@ -10,46 +10,71 @@
 
   <div class="grid gap-5 sm:grid-cols-2 xl:grid-cols-3">
     {% for card in cards %}
-    <article data-preview-card class="news-card overflow-hidden rounded-2xl border bg-white shadow-sm {% if card.id == target_id %}ring-2 ring-blue-500 ring-offset-2{% else %}border-slate-200{% endif %}">
-      <div class="news-card-image h-48 w-full">
-        {% if card.image_url %}
-          <img src="{{ card.image_url }}" alt="{{ card.title }}" class="h-full w-full object-cover" loading="lazy" referrerpolicy="no-referrer">
-        {% else %}
-          <div class="h-full w-full bg-slate-200"></div>
-        {% endif %}
-      </div>
-      <div class="flex h-[20rem] flex-col p-4">
-        <p class="text-xs font-semibold uppercase tracking-[0.14em] text-slate-500">
-          {{ card.published_at|date:"M d"|upper }} · {{ card.section|default:card.source_name }}
-        </p>
-        <h2 class="mt-2 text-xl font-bold leading-snug text-slate-900">{{ card.title }}</h2>
-        <p class="news-card-summary mt-3 text-sm leading-6 text-slate-700">{{ card.summary|default:"Summary unavailable." }}</p>
-
-        <div class="mt-4 flex flex-wrap gap-2 text-[11px] font-medium">
-          {% if card.section %}
-            <span class="rounded-full bg-blue-50 px-2 py-1 text-blue-700">Section: {{ card.section }}</span>
-          {% endif %}
-          {% if card.category %}
-            <span class="rounded-full bg-emerald-50 px-2 py-1 text-emerald-700">Category: {{ card.category }}</span>
-          {% endif %}
-          {% if card.subcategory %}
-            <span class="rounded-full bg-orange-50 px-2 py-1 text-orange-700">Sub-category: {{ card.subcategory }}</span>
-          {% endif %}
-        </div>
-
-        <div class="mt-auto pt-4">
-          {% if card.id == target_id %}
-            <a href="{{ detail_preview_path }}" class="inline-flex items-center rounded-lg border border-blue-300 bg-blue-50 px-3 py-1.5 text-sm font-semibold text-blue-700 hover:border-blue-500 hover:bg-blue-100">
-              Open detail preview
-            </a>
+    {% if card.id == target_id %}
+    <a href="{{ detail_preview_path }}" class="group block h-full" aria-label="Open detail preview for {{ card.title }}">
+      <article data-preview-card class="news-card h-full overflow-hidden rounded-2xl border bg-white shadow-sm ring-2 ring-blue-500 ring-offset-2 transition hover:-translate-y-0.5 hover:shadow-lg">
+        <div class="news-card-image h-48 w-full">
+          {% if card.image_url %}
+            <img src="{{ card.image_url }}" alt="{{ card.title }}" class="h-full w-full object-cover" loading="lazy" referrerpolicy="no-referrer">
           {% else %}
-            <a href="{% url 'news:article-detail' card.id %}" class="inline-flex items-center rounded-lg border border-slate-300 bg-slate-50 px-3 py-1.5 text-sm font-semibold text-slate-700 hover:border-blue-400 hover:text-blue-700">
-              Open public article
-            </a>
+            <div class="h-full w-full bg-slate-200"></div>
           {% endif %}
         </div>
-      </div>
-    </article>
+        <div class="flex h-[20rem] flex-col p-4">
+          <p class="text-xs font-semibold uppercase tracking-[0.14em] text-slate-500">
+            {{ card.published_at|date:"M d"|upper }} | {{ card.section|default:card.source_name }}
+          </p>
+          <h2 class="mt-2 text-xl font-bold leading-snug text-slate-900">{{ card.title }}</h2>
+          <p class="news-card-summary mt-3 text-sm leading-6 text-slate-700">{{ card.summary|default:"Summary unavailable." }}</p>
+
+          <div class="mt-4 flex flex-wrap gap-2 text-[11px] font-medium">
+            {% if card.section %}
+              <span class="rounded-full bg-blue-50 px-2 py-1 text-blue-700">Section: {{ card.section }}</span>
+            {% endif %}
+            {% if card.category %}
+              <span class="rounded-full bg-emerald-50 px-2 py-1 text-emerald-700">Category: {{ card.category }}</span>
+            {% endif %}
+            {% if card.subcategory %}
+              <span class="rounded-full bg-orange-50 px-2 py-1 text-orange-700">Sub-category: {{ card.subcategory }}</span>
+            {% endif %}
+          </div>
+
+                  </div>
+      </article>
+    </a>
+    {% else %}
+    <a href="{% url 'news:article-detail' card.id %}" class="group block h-full" aria-label="Open public article for {{ card.title }}">
+      <article data-preview-card class="news-card h-full overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm transition hover:-translate-y-0.5 hover:border-blue-300 hover:shadow-lg">
+        <div class="news-card-image h-48 w-full">
+          {% if card.image_url %}
+            <img src="{{ card.image_url }}" alt="{{ card.title }}" class="h-full w-full object-cover" loading="lazy" referrerpolicy="no-referrer">
+          {% else %}
+            <div class="h-full w-full bg-slate-200"></div>
+          {% endif %}
+        </div>
+        <div class="flex h-[20rem] flex-col p-4">
+          <p class="text-xs font-semibold uppercase tracking-[0.14em] text-slate-500">
+            {{ card.published_at|date:"M d"|upper }} | {{ card.section|default:card.source_name }}
+          </p>
+          <h2 class="mt-2 text-xl font-bold leading-snug text-slate-900">{{ card.title }}</h2>
+          <p class="news-card-summary mt-3 text-sm leading-6 text-slate-700">{{ card.summary|default:"Summary unavailable." }}</p>
+
+          <div class="mt-4 flex flex-wrap gap-2 text-[11px] font-medium">
+            {% if card.section %}
+              <span class="rounded-full bg-blue-50 px-2 py-1 text-blue-700">Section: {{ card.section }}</span>
+            {% endif %}
+            {% if card.category %}
+              <span class="rounded-full bg-emerald-50 px-2 py-1 text-emerald-700">Category: {{ card.category }}</span>
+            {% endif %}
+            {% if card.subcategory %}
+              <span class="rounded-full bg-orange-50 px-2 py-1 text-orange-700">Sub-category: {{ card.subcategory }}</span>
+            {% endif %}
+          </div>
+
+                  </div>
+      </article>
+    </a>
+    {% endif %}
     {% endfor %}
 
     {% for _i in placeholder_range %}

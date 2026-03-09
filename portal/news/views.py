@@ -7,10 +7,11 @@ import time
 import requests
 from django.conf import settings
 from django.core.paginator import Paginator
-from django.db.models import Count, Q
-from django.db.models.functions import TruncDate
+from django.db.models import Case, Count, F, IntegerField, Q, Value, When, Window
+from django.db.models.functions import Coalesce, TruncDate
 from django.http import Http404, HttpRequest, HttpResponse
 from django.shortcuts import get_object_or_404, render
+from django.utils.text import slugify
 from django.views.decorators.http import require_GET, require_http_methods, require_POST
 from django.contrib.postgres.search import SearchQuery, SearchRank
 
@@ -19,10 +20,37 @@ from .models import Article, Category, Newsletter, Resource
 
 def _base_queryset():
     return (
-        Article.objects.filter(is_review_approved=True, editorial_status="approved")
+        Article.objects.filter(
+            is_review_approved=True,
+            editorial_status="approved",
+            content_profile="news",
+        )
         .select_related("newsletter")
         .prefetch_related("categories")
     )
+
+
+def _annotate_equivalent_score(qs, *, url_field: str):
+    return qs.annotate(
+        _equivalent_group_count=Window(
+            expression=Count("id"),
+            partition_by=[F(url_field)],
+        )
+    ).annotate(
+        equivalent_score=Case(
+            When(**{f"{url_field}__isnull": True}, then=Value(1)),
+            When(**{url_field: ""}, then=Value(1)),
+            default=F("_equivalent_group_count"),
+            output_field=IntegerField(),
+        )
+    )
+
+
+def _news_card_queryset():
+    return _annotate_equivalent_score(
+        _base_queryset().annotate(sort_published_at=Coalesce("newsletter__original_sent_at", "newsletter__received_at", "published_at")),
+        url_field="original_url",
+    ).order_by("-sort_published_at", "-id")
 
 
 def _editorial_queryset():
@@ -35,20 +63,33 @@ def _editorial_queryset():
 
 def _approved_categories_queryset():
     return (
-        Category.objects.annotate(
-            approved_count=Count(
-                "articles",
-                filter=Q(articles__is_review_approved=True, articles__editorial_status="approved"),
-                distinct=True,
-            )
-        )
-        .filter(approved_count__gt=0)
-        .order_by("name")
+        _base_queryset()
+        .exclude(category="")
+        .values("category")
+        .annotate(approved_count=Count("id"))
+        .order_by("-approved_count", "category")
     )
 
 
+def _public_category_rows():
+    return [
+        {
+            "name": str(row["category"]).strip(),
+            "slug": slugify(str(row["category"]).strip()),
+            "article_count": int(row["approved_count"]),
+        }
+        for row in _approved_categories_queryset()
+        if str(row.get("category", "")).strip()
+    ]
+
+
 def _resource_queryset():
-    return Resource.objects.filter(is_active=True, review_status="approved")
+    return _annotate_equivalent_score(
+        Resource.objects.filter(is_active=True, review_status="approved").annotate(
+            sort_published_at=Coalesce("source_published_at", "published_at")
+        ),
+        url_field="resource_url",
+    ).order_by("-sort_published_at", "-id")
 
 
 def _review_api_base_url() -> str:
@@ -70,35 +111,23 @@ def _sign_resource_submit(resource_url: str) -> dict[str, str | int]:
 
 @require_GET
 def article_list(request: HttpRequest) -> HttpResponse:
-    qs = _base_queryset()
-
-    category_slug = request.GET.get("category", "").strip()
-    favorites_only = request.GET.get("favorites", "").strip() == "1"
-    unread_only = request.GET.get("unread", "").strip() == "1"
+    qs = _news_card_queryset()
     query_text = request.GET.get("q", "").strip()
 
-    if category_slug:
-        qs = qs.filter(categories__slug=category_slug)
-    if favorites_only:
-        qs = qs.filter(is_favorite=True)
-    if unread_only:
-        qs = qs.filter(is_read=False)
     if query_text:
         sq = SearchQuery(query_text)
-        qs = qs.annotate(rank=SearchRank("search_vector", sq)).filter(rank__gt=0.001).order_by("-rank", "-published_at")
+        qs = qs.annotate(rank=SearchRank("search_vector", sq)).filter(rank__gt=0.001).order_by("-rank", "-sort_published_at", "-id")
 
-    paginator = Paginator(qs.distinct(), 20)
+    paginator = Paginator(qs, 24)
     page_obj = paginator.get_page(request.GET.get("page", 1))
 
     context = {
         "page_obj": page_obj,
-        "categories": _approved_categories_queryset(),
         "filters": {
-            "category": category_slug,
-            "favorites": favorites_only,
-            "unread": unread_only,
             "q": query_text,
         },
+        "page_heading": "News",
+        "page_intro": "Published news cards with image, title, summary, taxonomy, original date, and source score.",
     }
 
     if getattr(request, "htmx", False):
@@ -108,7 +137,7 @@ def article_list(request: HttpRequest) -> HttpResponse:
 
 @require_GET
 def article_detail(request: HttpRequest, pk: int) -> HttpResponse:
-    article = get_object_or_404(_base_queryset(), pk=pk)
+    article = get_object_or_404(_news_card_queryset(), pk=pk)
     if not article.is_read:
         article.is_read = True
         article.save(update_fields=["is_read"])
@@ -162,7 +191,7 @@ def article_card_preview(request: HttpRequest, token) -> HttpResponse:
 
 @require_GET
 def article_card_public(request: HttpRequest, pk: int) -> HttpResponse:
-    article = get_object_or_404(_base_queryset(), pk=pk)
+    article = get_object_or_404(_news_card_queryset(), pk=pk)
     context_cards = list(_base_queryset().exclude(id=article.id).order_by("-published_at")[:5])
     cards = [article, *context_cards]
     placeholder_count = max(0, 6 - len(cards))
@@ -191,50 +220,42 @@ def toggle_favorite(request: HttpRequest, pk: int) -> HttpResponse:
 
 @require_GET
 def category_list(request: HttpRequest) -> HttpResponse:
-    categories = (
-        Category.objects.annotate(
-            article_count=Count(
-                "articles",
-                filter=Q(articles__is_review_approved=True, articles__editorial_status="approved"),
-                distinct=True,
-            )
-        )
-        .filter(article_count__gt=0)
-        .order_by("name")
-    )
-    return render(request, "news/category_list.html", {"categories": categories})
+    return render(request, "news/category_list.html", {"categories": _public_category_rows()})
 
 
 @require_GET
 def category_detail(request: HttpRequest, slug: str) -> HttpResponse:
-    category = get_object_or_404(Category, slug=slug)
-    qs = _base_queryset().filter(categories=category).distinct()
-    paginator = Paginator(qs, 20)
+    public_categories = _public_category_rows()
+    category = next((row for row in public_categories if row["slug"] == slug), None)
+    if not category:
+        raise Http404("Category not found")
+    qs = _news_card_queryset().filter(category=category["name"])
+    paginator = Paginator(qs, 24)
     page_obj = paginator.get_page(request.GET.get("page", 1))
     return render(
         request,
         "news/article_list.html",
         {
             "page_obj": page_obj,
-            "categories": _approved_categories_queryset(),
-            "filters": {"category": slug, "favorites": False, "unread": False, "q": ""},
+            "filters": {"q": ""},
             "selected_category": category,
+            "page_heading": category["name"],
+            "page_intro": "Filtered news cards for the selected category.",
         },
     )
 
 
 @require_GET
 def favorites(request: HttpRequest) -> HttpResponse:
-    qs = _base_queryset().filter(is_favorite=True)
-    paginator = Paginator(qs, 20)
+    qs = _news_card_queryset().filter(is_favorite=True)
+    paginator = Paginator(qs, 24)
     page_obj = paginator.get_page(request.GET.get("page", 1))
     return render(
         request,
         "news/favorites.html",
         {
             "page_obj": page_obj,
-            "categories": _approved_categories_queryset(),
-            "filters": {"category": "", "favorites": True, "unread": False, "q": ""},
+            "filters": {"q": ""},
         },
     )
 
@@ -286,12 +307,7 @@ def dashboard(request: HttpRequest) -> HttpResponse:
 @require_GET
 def resource_list(request: HttpRequest) -> HttpResponse:
     qs = _resource_queryset()
-
     query_text = request.GET.get("q", "").strip()
-    section_value = request.GET.get("section", "").strip()
-    category_value = request.GET.get("category", "").strip()
-    subcategory_value = request.GET.get("subcategory", "").strip()
-    featured_only = request.GET.get("featured", "").strip() == "1"
 
     if query_text:
         qs = qs.filter(
@@ -300,38 +316,20 @@ def resource_list(request: HttpRequest) -> HttpResponse:
             | Q(article_body__icontains=query_text)
             | Q(description__icontains=query_text)
         )
-    if section_value:
-        qs = qs.filter(section=section_value)
-    if category_value:
-        qs = qs.filter(category=category_value)
-    if subcategory_value:
-        qs = qs.filter(subcategory=subcategory_value)
-    if featured_only:
-        qs = qs.filter(is_featured=True)
 
-    paginator = Paginator(qs, 20)
+    paginator = Paginator(qs, 24)
     page_obj = paginator.get_page(request.GET.get("page", 1))
-
-    base = _resource_queryset()
-    sections = list(base.exclude(section="").values_list("section", flat=True).distinct().order_by("section"))
-    categories = list(base.exclude(category="").values_list("category", flat=True).distinct().order_by("category"))
-    subcategories = list(base.exclude(subcategory="").values_list("subcategory", flat=True).distinct().order_by("subcategory"))
 
     return render(
         request,
         "news/resource_list.html",
         {
             "page_obj": page_obj,
-            "sections": sections,
-            "categories": categories,
-            "subcategories": subcategories,
             "filters": {
                 "q": query_text,
-                "section": section_value,
-                "category": category_value,
-                "subcategory": subcategory_value,
-                "featured": featured_only,
             },
+            "page_heading": "Resources",
+            "page_intro": "Study materials and deep-dive resources with image, summary, taxonomy, original date, and source score.",
         },
     )
 
@@ -438,3 +436,5 @@ def resource_submit(request: HttpRequest) -> HttpResponse:
     context["result"] = data
     context["result_pretty"] = json.dumps(data, ensure_ascii=False, indent=2)
     return render(request, "news/resource_submit.html", context)
+
+

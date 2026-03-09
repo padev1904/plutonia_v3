@@ -8,7 +8,7 @@ from django.utils import timezone
 from .admin import ArticleAdmin, ResourceAdmin
 from .models import Article, Newsletter, Resource
 
-from .api_views import _resource_article_body_fallback, _resource_article_body_is_weak
+from .api_views import _newsletter_workflow_summary, _resource_article_body_fallback, _resource_article_body_is_weak
 
 
 class ResourceEditorialFallbackTests(SimpleTestCase):
@@ -166,3 +166,102 @@ class TestPublicCardView(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertContains(response, "Public card story")
         self.assertContains(response, f"/article/{article.id}/")
+
+
+class NewsletterWorkflowSummaryTests(TestCase):
+    def _newsletter(self, uid: str) -> Newsletter:
+        return Newsletter.objects.create(
+            gmail_uid=uid,
+            gmail_message_id=f"msg-{uid}",
+            sender_name="Sender",
+            sender_email="sender@example.com",
+            subject=f"Subject {uid}",
+            received_at=timezone.now() - timedelta(days=1),
+            raw_html="<html></html>",
+            status="review",
+            news_count=0,
+        )
+
+    def test_summary_returns_pending_when_some_articles_decided_but_not_all(self):
+        newsletter = self._newsletter("3001")
+        Article.objects.create(
+            title="Approved",
+            summary="summary",
+            original_url="https://example.com/a",
+            newsletter=newsletter,
+            is_review_approved=True,
+            editorial_status="approved",
+            telegram_triage_status="approved",
+        )
+        Article.objects.create(
+            title="Still pending",
+            summary="summary",
+            original_url="https://example.com/b",
+            newsletter=newsletter,
+            is_review_approved=True,
+            editorial_status="pending",
+            telegram_triage_status="not_sent",
+        )
+
+        summary = _newsletter_workflow_summary(newsletter)
+
+        self.assertEqual(summary["gmail_label"], "Pending")
+        self.assertEqual(summary["approved_articles"], 1)
+        self.assertEqual(summary["rejected_articles"], 0)
+        self.assertEqual(summary["unresolved_articles"], 1)
+
+    def test_summary_returns_published_when_all_articles_approved(self):
+        newsletter = self._newsletter("3002")
+        for idx in range(2):
+            Article.objects.create(
+                title=f"Approved {idx}",
+                summary="summary",
+                original_url=f"https://example.com/published-{idx}",
+                newsletter=newsletter,
+                is_review_approved=True,
+                editorial_status="approved",
+                telegram_triage_status="approved",
+            )
+
+        summary = _newsletter_workflow_summary(newsletter)
+        self.assertEqual(summary["gmail_label"], "Published")
+
+    def test_summary_returns_partial_when_mix_of_approved_and_rejected(self):
+        newsletter = self._newsletter("3003")
+        Article.objects.create(
+            title="Approved",
+            summary="summary",
+            original_url="https://example.com/partial-a",
+            newsletter=newsletter,
+            is_review_approved=True,
+            editorial_status="approved",
+            telegram_triage_status="approved",
+        )
+        Article.objects.create(
+            title="Rejected",
+            summary="summary",
+            original_url="https://example.com/partial-b",
+            newsletter=newsletter,
+            is_review_approved=True,
+            editorial_status="changes_requested",
+            telegram_triage_status="rejected",
+        )
+
+        summary = _newsletter_workflow_summary(newsletter)
+        self.assertEqual(summary["gmail_label"], "Partial")
+
+    def test_summary_returns_rejected_when_all_articles_rejected(self):
+        newsletter = self._newsletter("3004")
+        for idx in range(2):
+            Article.objects.create(
+                title=f"Rejected {idx}",
+                summary="summary",
+                original_url=f"https://example.com/rejected-{idx}",
+                newsletter=newsletter,
+                is_review_approved=True,
+                editorial_status="changes_requested",
+                telegram_triage_status="rejected",
+            )
+
+        summary = _newsletter_workflow_summary(newsletter)
+        self.assertEqual(summary["gmail_label"], "Rejected")

@@ -6,6 +6,7 @@ urlpatterns = [
     path("newsletter/register/", api_views.register_newsletter, name="api-register-newsletter"),
     path("newsletter/ingest-cursor/", api_views.get_ingest_cursor, name="api-ingest-cursor"),
     path("newsletter/<int:newsletter_id>/raw/", api_views.get_newsletter_raw, name="api-newsletter-raw"),
+    path("newsletter/<int:newsletter_id>/workflow-state/", api_views.get_newsletter_workflow_state, name="api-newsletter-workflow-state"),
     path("articles/publish/", api_views.publish_articles, name="api-publish-articles"),
     path("articles/editorial-data/", api_views.get_article_editorial_data, name="api-article-editorial-data"),
     path("articles/editorial-pending/", api_views.get_pending_article_editorial, name="api-article-editorial-pending"),

@@ -61,7 +61,8 @@ class ArticleAdmin(admin.ModelAdmin):
         "categories",
         "newsletter__sender_name",
     ]
-    search_fields = ["title", "summary"]
+    search_fields = ["title", "summary", "enrichment_context", "original_url", "newsletter__subject", "newsletter__sender_name"]
+    list_per_page = 50
     filter_horizontal = ["categories"]
     date_hierarchy = "published_at"
     readonly_fields = ["search_vector", "created_at", "updated_at"]
@@ -125,7 +126,8 @@ class ResourceAdmin(admin.ModelAdmin):
         "source_name",
     ]
     list_filter = ["review_status", "is_active", "is_featured", "section", "category", "subcategory"]
-    search_fields = ["title", "summary", "article_body", "description", "resource_url"]
+    search_fields = ["title", "summary", "article_body", "description", "resource_url", "category", "subcategory", "section"]
+    list_per_page = 50
     date_hierarchy = "published_at"
     actions = ["unpublish_selected_resources", "delete_selected_resources"]
 

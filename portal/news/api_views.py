@@ -17,6 +17,11 @@ from .models import Article, Category, Newsletter, ProcessingLog, Resource
 
 logger = logging.getLogger("news")
 
+GMAIL_REVIEW_LABEL_PENDING = "Pending"
+GMAIL_REVIEW_LABEL_PUBLISHED = "Published"
+GMAIL_REVIEW_LABEL_PARTIAL = "Partial"
+GMAIL_REVIEW_LABEL_REJECTED = "Rejected"
+
 
 def _clean_keyword(value: str) -> str:
     return " ".join(str(value).split()).strip()[:100]
@@ -165,6 +170,42 @@ def _refresh_newsletter_editorial_state(newsletter: Newsletter) -> None:
     newsletter.save(update_fields=["status", "error_message", "processed_at", "news_count"])
 
 
+
+
+
+def _newsletter_workflow_summary(newsletter: Newsletter) -> dict:
+    articles_qs = Article.objects.filter(newsletter=newsletter, is_review_approved=True)
+    total_articles = articles_qs.count()
+    approved_articles = articles_qs.filter(editorial_status="approved").count()
+    rejected_articles = articles_qs.filter(telegram_triage_status="rejected").count()
+    unresolved_articles = max(0, total_articles - approved_articles - rejected_articles)
+    analyzed_articles = approved_articles + rejected_articles
+
+    gmail_label = ""
+    if total_articles > 0:
+        if unresolved_articles > 0:
+            if analyzed_articles > 0:
+                gmail_label = GMAIL_REVIEW_LABEL_PENDING
+        elif approved_articles == total_articles:
+            gmail_label = GMAIL_REVIEW_LABEL_PUBLISHED
+        elif rejected_articles == total_articles:
+            gmail_label = GMAIL_REVIEW_LABEL_REJECTED
+        elif approved_articles > 0 and rejected_articles > 0:
+            gmail_label = GMAIL_REVIEW_LABEL_PARTIAL
+
+    return {
+        "newsletter_id": newsletter.id,
+        "gmail_uid": newsletter.gmail_uid,
+        "status": newsletter.status,
+        "subject": newsletter.subject,
+        "total_articles": total_articles,
+        "approved_articles": approved_articles,
+        "rejected_articles": rejected_articles,
+        "unresolved_articles": unresolved_articles,
+        "analyzed_articles": analyzed_articles,
+        "gmail_label": gmail_label,
+    }
+
 def _article_editorial_payload(article: Article) -> dict:
     return {
         "id": article.id,
@@ -179,6 +220,8 @@ def _article_editorial_payload(article: Article) -> dict:
         "preview_path": f"/preview/{article.preview_token}/",
         "preview_card_path": f"/preview/card/{article.preview_token}/",
         "published_at": article.published_at.isoformat(),
+        "image_url": article.image_url,
+        "proposed_title": article.proposed_title,
         "section": article.section,
         "category": article.category,
         "subcategory": article.subcategory,
@@ -186,6 +229,12 @@ def _article_editorial_payload(article: Article) -> dict:
         "public_visible": bool(article.is_review_approved and article.editorial_status == "approved"),
         "telegram_triage_status": article.telegram_triage_status,
         "content_profile": article.content_profile,
+        "link_validation_status": article.link_validation_status,
+        "link_validation_confidence": article.link_validation_confidence,
+        "link_validation_reason": article.link_validation_reason,
+        "source_link_origin": article.source_link_origin,
+        "newsletter_original_sent_at": article.newsletter.original_sent_at.isoformat() if article.newsletter.original_sent_at else "",
+        "newsletter_received_at": article.newsletter.received_at.isoformat() if article.newsletter.received_at else "",
     }
 
 
@@ -304,7 +353,7 @@ def publish_articles(request):
         created_payload = []
         keep_indices: set[int] = set()
         prune_missing = str(data.get("prune_missing", "true")).strip().lower() in {"1", "true", "yes", "on"}
-        default_published_at = newsletter.received_at or timezone.now()
+        default_published_at = newsletter.original_sent_at or newsletter.received_at or timezone.now()
         now_value = timezone.now()
         for idx, article_data in enumerate(data.get("articles", []), start=1):
             if not isinstance(article_data, dict):
@@ -454,9 +503,12 @@ def get_ingest_cursor(_request):
 @api_key_required
 def get_pending_newsletters(request):
     status_value = str(request.GET.get("status", "pending")).strip().lower() or "pending"
-    allowed_status = {"pending", "review", "processing"}
+    allowed_status = {"pending", "review", "processing", "completed", "error"}
     if status_value not in allowed_status:
         return JsonResponse({"error": f"invalid status: {status_value}"}, status=400)
+    mode = str(request.GET.get("mode", "oldest")).strip().lower() or "oldest"
+    if mode not in {"oldest", "latest"}:
+        return JsonResponse({"error": f"invalid mode: {mode}"}, status=400)
     limit_raw = str(request.GET.get("limit", "50")).strip()
     try:
         limit = max(1, min(200, int(limit_raw)))
@@ -464,9 +516,13 @@ def get_pending_newsletters(request):
         limit = 50
 
     base_qs = Newsletter.objects.filter(status=status_value)
+    order_fields = ("sort_original_sent_at", "received_at", "id")
+    if mode == "latest":
+        order_fields = ("-sort_original_sent_at", "-received_at", "-id")
+
     pending_qs = (
         base_qs.annotate(sort_original_sent_at=Coalesce("original_sent_at", "received_at"))
-        .order_by("sort_original_sent_at", "received_at", "id")
+        .order_by(*order_fields)
         .values(
             "id",
             "gmail_uid",
@@ -486,8 +542,25 @@ def get_pending_newsletters(request):
     return JsonResponse(
         {
             "status": status_value,
+            "mode": mode,
             "pending_count": base_qs.count(),
             "newsletters": list(pending_qs),
+        }
+    )
+
+
+@require_GET
+@api_key_required
+def get_newsletter_workflow_state(_request, newsletter_id: int):
+    try:
+        newsletter = Newsletter.objects.get(id=int(newsletter_id))
+    except Newsletter.DoesNotExist:
+        return JsonResponse({"error": "Newsletter not found"}, status=404)
+
+    return JsonResponse(
+        {
+            "status": "ok",
+            "newsletter": _newsletter_workflow_summary(newsletter),
         }
     )
 
@@ -555,10 +628,38 @@ def get_pending_article_editorial(request):
         .filter(is_review_approved=True, editorial_status="pending")
     )
 
-    # When the Telegram inline bot is polling, exclude articles already sent for triage.
-    # This prevents the triage job from stalling on the first article.
+    newsletter_id_raw = str(request.GET.get("newsletter_id", "")).strip()
+    if newsletter_id_raw:
+        try:
+            newsletter_id = int(newsletter_id_raw)
+        except ValueError:
+            return JsonResponse({"error": "newsletter_id must be an integer"}, status=400)
+        pending_qs = pending_qs.filter(newsletter_id=newsletter_id)
+
+    # When the Telegram inline bot is polling, do not advance to the next article if one
+    # article is already active in Telegram review. This enforces a strict one-at-a-time flow.
     exclude_tg = str(request.GET.get("exclude_tg_triaged", "")).strip().lower()
     if exclude_tg in {"1", "true", "yes", "on"}:
+        active_tg_statuses = (
+            "awaiting_triage",
+            "awaiting_llm",
+            "pending_approval",
+            "waiting_user_input",
+            "waiting_edit",
+            "blocked_llm",
+        )
+        active_qs = pending_qs.filter(telegram_triage_status__in=active_tg_statuses)
+        if active_qs.exists():
+            active_article = active_qs.order_by("published_at", "id").first() if mode == "oldest" else active_qs.order_by("-published_at", "-id").first()
+            return JsonResponse(
+                {
+                    "status": "no_pending_context",
+                    "reason": "active_triage_exists",
+                    "mode": mode,
+                    "pending_editorial_count": pending_qs.count(),
+                    "article": _article_editorial_payload(active_article) if active_article else None,
+                }
+            )
         pending_qs = pending_qs.filter(telegram_triage_status="not_sent")
 
     pending_count = pending_qs.count()

@@ -173,6 +173,69 @@ ANCHOR_NOISE_TEXT_RE = re.compile(
     r"\bforwarded this\??\b|\bmanage preferences\b|\bunsubscribe\b|\bclick to execute\b)",
     re.IGNORECASE,
 )
+INVALID_TITLE_VALUES = {"", "sem titulo", "untitled", "none", "null", "n/a", "na"}
+EMAIL_PHONE_RE = re.compile(r"^\+\d[\d\s\-]{6,}$")
+EMAIL_MIN_VISIBLE_CHARS = 5
+EMAIL_FORWARD_LABELS = {
+    "From:", "Sent:", "To:", "Subject:", "Date:",
+    "De:", "Enviado:", "Para:", "Assunto:", "Data:",
+}
+EMAIL_FORWARD_SUB_LABELS = {"On Behalf Of"}
+EMAIL_FORWARD_HEADER_PREFIXES = (
+    "From: ", "Sent: ", "To: ", "Subject: ", "Date: ",
+    "De: ", "Enviado: ", "Para: ", "Assunto: ", "Data: ",
+)
+EMAIL_DISCARD_PATTERNS = (
+    "CONFIDENTIALITY NOTICE",
+    "Substack Inc",
+    "Market Street",
+    "Unsubscribe",
+    "Start writing",
+    "See more notes in the Substack app",
+    "e-mail transmission and eventual attached files",
+)
+EMAIL_DISCARD_ENDSWITH = (" liked",)
+EMAIL_DISCARD_EXACT = {"You follow"}
+EMAIL_DISCARD_CONTAINS = ("posted new notes",)
+EMAIL_IMAGE_MIN_SIZE = 50
+EMAIL_IMAGE_DISCARD_PATTERNS = (
+    "open.substack.com",
+    "pixel",
+    "track",
+    "beacon",
+    "1x1",
+    "email.mg-",
+    "cid:",
+)
+
+TITLE_PROPOSAL_PROMPT = """You are a title generation assistant.
+Generate a single concise and engaging title for the content below.
+The title must be based only on the text provided.
+Ignore newsletter wrapper text, email headers, sender names, author bylines, and phrases such as
+"posted new notes", "is now available", "highlighted in newsletter", or similar digest framing.
+Focus on the main subject of the article itself.
+Do not include the author/publication name unless the article is actually about that person/publication.
+Prefer concrete topic nouns over generic wording like newsletter, update, note, roundup, or developments.
+
+Output ONLY raw JSON with this exact structure:
+{{
+  "title": "..."
+}}
+
+Profile: {content_profile}
+Text:
+{article_text}
+"""
+
+GENERIC_TITLE_HINTS = (
+    "newsletter",
+    "highlighted in newsletter",
+    "posted new notes",
+    "news roundup",
+    "digest",
+    "multiple ai developments",
+    "emerging ai developments",
+)
 
 CLASSIFY_PROMPT = """Classify this newsletter content as either "digest" or "article".
 
@@ -689,6 +752,28 @@ def _extract_forwarded_subject_hint(raw_html: str) -> str:
     return ""
 
 
+def _extract_anchor_context_text(anchor: Tag) -> str:
+    text = _compact_text(anchor.get_text(" ", strip=True))
+    if text and len(re.findall(r"[A-Za-z0-9]+", text)) >= 2 and not ANCHOR_NOISE_TEXT_RE.search(text):
+        return text[:320]
+
+    img = anchor.find("img")
+    if isinstance(img, Tag):
+        alt = _compact_text(str(img.get("alt", "")))
+        if alt and len(re.findall(r"[A-Za-z0-9]+", alt)) >= 2 and not ANCHOR_NOISE_TEXT_RE.search(alt):
+            return alt[:320]
+
+    container = anchor
+    allowed = {"td", "div", "tr", "li", "p", "section", "article", "body"}
+    while isinstance(container, Tag):
+        if container.name in allowed:
+            context = _compact_text(container.get_text(" ", strip=True))
+            if context and len(re.findall(r"[A-Za-z0-9]+", context)) >= 2 and not ANCHOR_NOISE_TEXT_RE.search(context):
+                return context[:320]
+        container = container.parent
+    return ""
+
+
 def _extract_email_anchor_candidates(raw_html: str, *, limit: int = 250) -> list[dict[str, str]]:
     if not raw_html:
         return []
@@ -706,10 +791,10 @@ def _extract_email_anchor_candidates(raw_html: str, *, limit: int = 250) -> list
         if _is_noise_link(href):
             continue
 
-        text = _compact_text(anchor.get_text(" ", strip=True))
+        text = _extract_anchor_context_text(anchor)
         if not text or len(text) < 10:
             continue
-        if len(re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9]+", text)) < 2:
+        if len(re.findall(r"[A-Za-z0-9]+", text)) < 2:
             continue
         if ANCHOR_NOISE_TEXT_RE.search(text):
             continue
@@ -1246,8 +1331,403 @@ def _apply_source_metadata(article: dict[str, Any]) -> dict[str, Any]:
 def _clean_heading_title(text: str) -> str:
     title = _compact_text(text)
     # Remove leading emoji / bullets while preserving normal punctuation in the title body.
-    title = re.sub(r"^[^\wA-Za-zÀ-ÖØ-öø-ÿ]+", "", title).strip()
+    title = re.sub(r"^[^\wA-Za-z]+", "", title).strip()
     return title
+
+
+def _visible_text_length(text: str) -> int:
+    cleaned = re.sub(r"[\u200b\u200c\u200d\ufeff\u034f\xad\s]", "", text or "")
+    return len(cleaned)
+
+
+def _is_valid_title_value(value: str | None) -> bool:
+    if value is None:
+        return False
+    title = str(value).strip()
+    if not title:
+        return False
+    return title.lower() not in INVALID_TITLE_VALUES
+
+
+def _title_needs_refinement(value: str | None) -> bool:
+    if not _is_valid_title_value(value):
+        return True
+    title = str(value).strip().lower()
+    if any(hint in title for hint in GENERIC_TITLE_HINTS):
+        return True
+    if "highlighted" in title and "newsletter" in title:
+        return True
+    if "developments" in title and "newsletter" in title:
+        return True
+    if "updates on" in title:
+        return True
+    if ("developments" in title or "breakthrough" in title or "breakthroughs" in title) and (" and " in title or "/" in title):
+        return True
+    if any(token in title for token in ("clawdbot", "openclaw")) and (" and " in title or "/" in title or "," in title):
+        return True
+    return False
+
+
+def _clean_title_prompt_text(article_text: str) -> str:
+    text = _compact_text(article_text or "")
+    if not text:
+        return ""
+
+    cut_markers = (
+        "on a little tangent:",
+        "on a side note:",
+        "separately,",
+        "meanwhile,",
+    )
+    lower = text.lower()
+    cut_positions = []
+    for marker in cut_markers:
+        pos = lower.find(marker)
+        if pos > 0:
+            cut_positions.append(pos)
+    if cut_positions:
+        text = text[: min(cut_positions)].strip()
+
+    chapter_match = re.search(r"(?:ch\s+\d+|chapter\s+\d+)", text, flags=re.IGNORECASE)
+    if chapter_match and chapter_match.start() <= 180:
+        text = text[chapter_match.start():].strip()
+
+    text = re.sub(
+        r"^(?:[A-Z][A-Za-z0-9&.,'/-]+\s+){2,10}(?=(?:How|Why|What|When|Reinforcement|Claude|BuildML|OpenAI|Anthropic|Google|Meta|NVIDIA|Mistral|Agent|Training|Reasoning|Ch\s+\d+|Chapter\s+\d+))",
+        "",
+        text,
+    ).strip()
+    return text[:3000]
+
+
+def _propose_title_with_llm(cfg: Config, article_text: str, content_profile: str = "news") -> str | None:
+    text = _clean_title_prompt_text(article_text)
+    if not text:
+        return None
+
+    prompt = TITLE_PROPOSAL_PROMPT.format(
+        content_profile=content_profile,
+        article_text=text,
+    )
+    try:
+        response = _llm_generate(cfg, prompt, model_override=cfg.ollama_model_title or "")
+        parsed = _safe_json_object(response)
+    except Exception as exc:
+        LOG.warning("title proposal failed err=%s", exc)
+        return None
+
+    title = str(parsed.get("title", "")).strip()
+    if not _is_valid_title_value(title):
+        return None
+    return title
+
+
+def _ensure_article_title(cfg: Config, article: dict[str, Any], article_text: str, *, content_profile: str = "news") -> bool:
+    raw_title = str(article.get("title", "")).strip()
+    if _is_valid_title_value(raw_title):
+        article["title"] = raw_title[:500]
+        return True
+
+    generated = _propose_title_with_llm(cfg, article_text, content_profile=content_profile)
+    if not generated:
+        return False
+
+    article["title"] = generated[:500]
+    article["title_origin"] = "llm_proposed"
+    return True
+
+
+def _is_email_junk(text: str) -> bool:
+    value = str(text or "").strip()
+    if _visible_text_length(value) < EMAIL_MIN_VISIBLE_CHARS:
+        return True
+    if any(pattern in value for pattern in EMAIL_DISCARD_PATTERNS):
+        return True
+    if any(value.endswith(suffix) for suffix in EMAIL_DISCARD_ENDSWITH):
+        return True
+    if value in EMAIL_DISCARD_EXACT:
+        return True
+    if any(fragment in value for fragment in EMAIL_DISCARD_CONTAINS):
+        return True
+    if EMAIL_PHONE_RE.match(value):
+        return True
+    return False
+
+
+def _is_email_forward_header(text: str) -> tuple[str, str] | None:
+    value = str(text or "")
+    for prefix in EMAIL_FORWARD_HEADER_PREFIXES:
+        if value.startswith(prefix):
+            return prefix.rstrip(": "), value[len(prefix):].strip()
+    return None
+
+
+def _is_email_forward_label(text: str) -> str | None:
+    stripped = str(text or "").strip()
+    if stripped in EMAIL_FORWARD_LABELS:
+        return stripped.rstrip(":")
+    return None
+
+
+def _get_email_img_dimension(img_tag: Tag) -> int:
+    best = 0
+    for attr in ("width", "height"):
+        value = img_tag.get(attr, "")
+        try:
+            best = max(best, int(str(value).replace("px", "")))
+        except (TypeError, ValueError):
+            pass
+
+    if best == 0:
+        src = str(img_tag.get("src", ""))
+        matches = re.findall(r"[wh]_(\d{2,})", src)
+        if matches:
+            best = max(int(match) for match in matches)
+    return best
+
+
+def _normalize_email_image_url(src: str) -> str:
+    value = str(src or "").strip()
+    if "substackcdn.com/image/fetch" in value:
+        parts = value.split("/https%3A%2F%2F")
+        if len(parts) > 1:
+            return "https://" + urllib.parse.unquote(parts[1])
+        parts = value.split("/https://")
+        if len(parts) > 1:
+            return "https://" + parts[1]
+    return value
+
+
+def _is_relevant_email_image(img_tag: Tag) -> bool:
+    src = str(img_tag.get("src", "")).strip()
+    if not src:
+        return False
+    src_lower = src.lower()
+    if any(pattern in src_lower for pattern in EMAIL_IMAGE_DISCARD_PATTERNS):
+        return False
+    alt = str(img_tag.get("alt", "")).strip().lower()
+    if alt in {"start writing", "substack"}:
+        return False
+    dim = _get_email_img_dimension(img_tag)
+    if 0 < dim < EMAIL_IMAGE_MIN_SIZE:
+        return False
+    return True
+
+
+def _collect_post_readmore_images(element: Tag, limit: int = 5) -> list[str]:
+    images: list[str] = []
+    current = element.parent
+    while current and current.name not in {"td", "div", "tr", "body", "[document]"}:
+        current = current.parent
+
+    if not current:
+        return images
+
+    for sibling in current.find_next_siblings(limit=limit * 3):
+        if len(images) >= limit:
+            break
+        if not isinstance(sibling, Tag):
+            continue
+        for img in sibling.find_all("img", recursive=True):
+            if not _is_relevant_email_image(img):
+                continue
+            url = _normalize_email_image_url(str(img.get("src", "")))
+            if url and url not in images:
+                images.append(url)
+                if len(images) >= limit:
+                    break
+    return images
+
+
+def _extract_read_more_link(element: Tag) -> str:
+    if element.name == "a":
+        return _normalize_url(str(element.get("href", "")).strip())
+
+    a_parent = element.find_parent("a")
+    if isinstance(a_parent, Tag):
+        return _normalize_url(str(a_parent.get("href", "")).strip())
+
+    previous = element.find_all_previous("a", limit=1)
+    if previous:
+        return _normalize_url(str(previous[0].get("href", "")).strip())
+    return ""
+
+
+def _finalize_email_segment(segment: dict[str, Any]) -> dict[str, Any] | None:
+    text_lines = [_compact_text(line) for line in segment.get("text", []) if _compact_text(line)]
+    if not text_lines:
+        return None
+    full_text = " ".join(text_lines).strip()
+    if _visible_text_length(full_text) <= 20:
+        return None
+    images = list(dict.fromkeys(str(url).strip() for url in segment.get("images", []) if str(url).strip()))
+    return {
+        "text": text_lines,
+        "full_text": full_text,
+        "images": images,
+        "original_url": _normalize_url(str(segment.get("original_url", "")).strip()),
+    }
+
+
+def _fallback_title_from_text(text: str) -> str:
+    lines = [
+        _clean_heading_title(line)
+        for line in re.split(r"\n+", str(text or ""))
+        if _compact_text(line)
+    ]
+    for line in lines:
+        if len(line) < 12 or _is_promo_text(line):
+            continue
+        sentence = re.split(r"(?<=[.!?])\s+", line, maxsplit=1)[0].strip()
+        candidate = sentence or line
+        if len(candidate) > 160:
+            candidate = candidate[:159].rstrip() + "..."
+        if len(candidate) >= 12:
+            return candidate
+
+    words = re.findall(r"\S+", _compact_text(text))
+    return " ".join(words[:12]).strip()[:160]
+
+
+def _fallback_summary_from_text(text: str, max_chars: int = 800) -> str:
+    compact = _compact_text(text)
+    if not compact:
+        return ""
+    sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+", compact) if part.strip()]
+    summary = " ".join(sentences[:3]).strip()
+    if len(summary) < 120:
+        summary = compact[:max_chars].strip()
+    if len(summary) > max_chars:
+        summary = summary[: max_chars - 3].rstrip() + "..."
+    return _normalize_summary_text(summary)
+
+
+def _segment_article_with_llm(
+    cfg: Config,
+    segment: dict[str, Any],
+    *,
+    content_profile: str = "news",
+) -> dict[str, Any]:
+    segment_text = str(segment.get("full_text", "")).strip()
+    extracted = extract_articles(cfg, segment_text[:6000], "article")
+    article = dict(extracted[0]) if extracted else {}
+
+    article["summary"] = _normalize_summary_text(str(article.get("summary", "")).strip()) or _fallback_summary_from_text(segment_text)
+    article.setdefault("categories", [])
+    article.setdefault("section", "")
+    article.setdefault("category", "")
+    article.setdefault("subcategory", "")
+    article["content_profile"] = content_profile if content_profile in {"news", "resource"} else "news"
+
+    original_url = _normalize_url(str(segment.get("original_url", "")).strip())
+    if original_url:
+        article["original_url"] = original_url
+        article["source_origin"] = "direct_email_parser"
+
+    images = list(dict.fromkeys(str(url).strip() for url in segment.get("images", []) if str(url).strip()))
+    if images:
+        article["email_images"] = images
+        article.setdefault("image_url", images[0])
+
+    article["raw_email_segment_text"] = segment_text
+    article["enrichment_context"] = segment_text
+    article = _taxonomy_defaults(article)
+
+    if _title_needs_refinement(article.get("title")):
+        article["title"] = ""
+        article["title_origin"] = "needs_refinement"
+
+    if not _ensure_article_title(cfg, article, segment_text, content_profile=content_profile):
+        fallback_title = _fallback_title_from_text(segment_text) or "Untitled article"
+        article["title"] = fallback_title[:500]
+        article["manual_review_required"] = True
+        article.setdefault("review_note", "LLM failed to propose a reliable title for this email segment.")
+    return article
+
+
+def _extract_articles_from_email_html(cfg: Config, raw_html: str) -> list[dict[str, Any]]:
+    if not raw_html:
+        return []
+
+    try:
+        soup = BeautifulSoup(raw_html, "lxml")
+    except Exception:
+        return []
+
+    for tag in soup(["style", "script", "head", "meta", "title"]):
+        tag.decompose()
+
+    segments: list[dict[str, Any]] = []
+    current = {"text": [], "images": [], "original_url": ""}
+    pending_forward_label: str | None = None
+    skip_next = False
+
+    for node in soup.descendants:
+        if isinstance(node, Tag) and node.name == "img":
+            if _is_relevant_email_image(node):
+                url = _normalize_email_image_url(str(node.get("src", "")))
+                if url and url not in current["images"]:
+                    current["images"].append(url)
+            continue
+
+        if not isinstance(node, NavigableString):
+            continue
+
+        text_value = str(node).strip()
+        if len(text_value) < 3:
+            continue
+
+        parent = getattr(node, "parent", None)
+        if parent is None:
+            continue
+
+        if skip_next:
+            skip_next = False
+            continue
+
+        if pending_forward_label:
+            pending_forward_label = None
+            continue
+
+        forward_label = _is_email_forward_label(text_value)
+        if forward_label:
+            pending_forward_label = forward_label
+            continue
+
+        if text_value.strip() in EMAIL_FORWARD_SUB_LABELS:
+            skip_next = True
+            continue
+
+        if _is_email_forward_header(text_value):
+            continue
+
+        if _is_email_junk(text_value):
+            continue
+
+        if text_value.lower().startswith("read more"):
+            link = _extract_read_more_link(parent)
+            if link and not current["original_url"]:
+                current["original_url"] = link
+            for img_url in _collect_post_readmore_images(parent):
+                if img_url not in current["images"]:
+                    current["images"].append(img_url)
+            finalized = _finalize_email_segment(current)
+            if finalized is not None:
+                segments.append(finalized)
+            current = {"text": [], "images": [], "original_url": ""}
+            continue
+
+        current["text"].append(text_value)
+
+    finalized = _finalize_email_segment(current)
+    if finalized is not None:
+        segments.append(finalized)
+
+    if len(segments) < 2:
+        return []
+
+    articles = [_segment_article_with_llm(cfg, segment) for segment in segments]
+    return [article for article in articles if str(article.get("summary", "")).strip()]
 
 
 def _build_summary(chunks: list[str], max_chars: int = 1200) -> str:
@@ -2030,6 +2510,7 @@ def _attach_discovered_source_before_review(cfg: Config, article: dict[str, Any]
     out = dict(article)
     existing = _normalize_url(str(out.get("original_url", "")).strip())
     preferred_host = _normalized_host_from_url(existing)
+    current_origin = str(out.get("source_origin", "")).strip().lower()
     anchor_hint = str(out.get("source_anchor_text", "")).strip()
     subject_hint = str(out.get("newsletter_subject_hint", "")).strip()
     semantic_references = [v for v in [anchor_hint, subject_hint] if v]
@@ -2058,6 +2539,26 @@ def _attach_discovered_source_before_review(cfg: Config, article: dict[str, Any]
             and direct_semantic_match
         )
         if direct_has_content:
+            return out
+
+        preserve_direct_email_source = (
+            current_origin in {"direct_email_parser", "direct_email_anchor"}
+            and not preferred_host.startswith("link.mail.")
+        )
+        if preserve_direct_email_source:
+            out.setdefault(
+                "source_discovery",
+                {
+                    "attempted": False,
+                    "reason": "preserve_direct_email_source",
+                    "selected_url": "",
+                    "direct_url_checked": True,
+                    "direct_url_generic": False,
+                    "direct_url_has_content": direct_has_content,
+                    "direct_url_semantic_match": direct_semantic_match,
+                    "direct_url_title_overlap": round(direct_overlap_ratio, 3),
+                },
+            )
             return out
 
     if existing_is_generic:
@@ -2339,20 +2840,25 @@ def extract_articles(cfg: Config, text: str, newsletter_type: str) -> list[dict[
             cleaned: list[dict[str, Any]] = []
             for row in parsed:
                 normalized_summary = _normalize_summary_text(str(row.get("summary", "")))
-                cleaned.append(
-                    _taxonomy_defaults(
-                        {
-                            "title": str(row.get("title", "")).strip()[:500],
-                            "summary": normalized_summary,
-                            "original_url": str(row.get("original_url", "")).strip(),
-                            "categories": _normalize_keywords(row.get("categories", []), limit=10),
-                            "section": str(row.get("section", "")).strip(),
-                            "category": str(row.get("category", "")).strip(),
-                            "subcategory": str(row.get("subcategory", "")).strip(),
-                        }
-                    )
+                candidate = _taxonomy_defaults(
+                    {
+                        "title": str(row.get("title", "")).strip()[:500],
+                        "summary": normalized_summary,
+                        "original_url": str(row.get("original_url", "")).strip(),
+                        "categories": _normalize_keywords(row.get("categories", []), limit=10),
+                        "section": str(row.get("section", "")).strip(),
+                        "category": str(row.get("category", "")).strip(),
+                        "subcategory": str(row.get("subcategory", "")).strip(),
+                    }
                 )
-            return [r for r in cleaned if r["title"] and r["summary"]]
+                context_for_title = normalized_summary or text[:3000]
+                if not _ensure_article_title(cfg, candidate, context_for_title):
+                    LOG.warning("dropping extracted article without reliable title")
+                    continue
+                if candidate["title"] and candidate["summary"]:
+                    cleaned.append(candidate)
+            if cleaned:
+                return cleaned
     return []
 
 
@@ -2445,6 +2951,10 @@ def rewrite_article_from_source(cfg: Config, article: dict[str, Any]) -> dict[st
     if categories:
         out["categories"] = categories
 
+    title_context = article_body or source_text or summary or str(out.get("summary", "")).strip()
+    if not _ensure_article_title(cfg, out, title_context):
+        return _require_manual("Model failed to generate a reliable title from the source content.")
+
     preview_issues = article_preview_quality_issues(out)
     if preview_issues:
         return _require_manual(
@@ -2521,6 +3031,133 @@ def _write_review_bundle(
     return str(out_path)
 
 
+def _normalize_content_profile(value: Any) -> str:
+    profile = str(value or "").strip().lower()
+    if profile in {"news", "resource"}:
+        return profile
+    return "news"
+
+
+def _source_link_origin_from_article(article: dict[str, Any]) -> str:
+    explicit = str(article.get("source_link_origin", "")).strip().lower()
+    if explicit in {"email", "search", "user"}:
+        return explicit
+    source_origin = str(article.get("source_origin", "")).strip().lower()
+    if source_origin.startswith("direct") or source_origin in {"email", "direct_email_parser", "direct_email_anchor"}:
+        return "email"
+    if "search" in source_origin or "discover" in source_origin or source_origin == "inferred":
+        return "search"
+    return "email"
+
+
+def _sync_review_articles_to_portal(
+    cfg: Config,
+    newsletter_id: int,
+    articles: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    preview_payload: list[dict[str, Any]] = []
+    for idx, row in enumerate(articles, start=1):
+        item = dict(row)
+        item["_article_index"] = idx
+        item["content_profile"] = _normalize_content_profile(item.get("content_profile"))
+        preview_payload.append(item)
+
+    result = _api_post(
+        cfg,
+        "articles/publish/",
+        {
+            "newsletter_id": int(newsletter_id),
+            "articles": preview_payload,
+            "mode": "preview",
+            "prune_missing": True,
+        },
+    )
+
+    published_rows = result.get("articles", []) if isinstance(result, dict) else []
+    row_by_index: dict[int, dict[str, Any]] = {}
+    for row in published_rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            draft_index = int(row.get("draft_article_index") or 0)
+        except Exception:
+            continue
+        if draft_index > 0:
+            row_by_index[draft_index] = row
+
+    updated_articles: list[dict[str, Any]] = []
+    missing_preview_rows: list[int] = []
+    for idx, article in enumerate(articles, start=1):
+        item = dict(article)
+        row = row_by_index.get(idx)
+        if not row:
+            missing_preview_rows.append(idx)
+            updated_articles.append(item)
+            continue
+
+        article_id = row.get("id")
+        preview_path = str(row.get("preview_path", "")).strip()
+        preview_token = str(row.get("preview_token", "")).strip()
+        editorial_status = str(row.get("editorial_status", "")).strip()
+
+        if article_id is not None:
+            item["portal_article_id"] = article_id
+        if preview_path:
+            item["preview_path"] = preview_path
+            item["editorial_preview_path"] = preview_path
+        if preview_token:
+            item["preview_token"] = preview_token
+            item["editorial_preview_token"] = preview_token
+            item["preview_card_path"] = f"/preview/card/{preview_token}/"
+        if editorial_status:
+            item["editorial_status"] = editorial_status
+        item["content_profile"] = _normalize_content_profile(item.get("content_profile"))
+        item["telegram_triage_status"] = "not_sent"
+
+        if article_id is not None:
+            persist_payload: dict[str, Any] = {
+                "article_id": int(article_id),
+                "telegram_triage_status": "not_sent",
+                "content_profile": item["content_profile"],
+                "source_link_origin": _source_link_origin_from_article(item),
+            }
+            title_for_telegram = str(item.get("proposed_title", "")).strip() or str(item.get("title", "")).strip()
+            if title_for_telegram:
+                persist_payload["proposed_title"] = title_for_telegram[:500]
+            original_url = str(item.get("original_url", "")).strip()
+            if original_url:
+                persist_payload["original_url"] = original_url
+            status_value = str(item.get("link_validation_status", "")).strip()
+            if status_value in {"not_checked", "valid", "uncertain", "invalid"}:
+                persist_payload["link_validation_status"] = status_value
+            if "link_validation_confidence" in item:
+                try:
+                    persist_payload["link_validation_confidence"] = float(item.get("link_validation_confidence", 0.0) or 0.0)
+                except Exception:
+                    pass
+            reason = str(item.get("link_validation_reason", "")).strip()
+            if reason:
+                persist_payload["link_validation_reason"] = reason[:2000]
+            try:
+                _api_post(cfg, "articles/link-validation/", persist_payload)
+            except Exception as exc:
+                LOG.warning(
+                    "failed to persist preview triage metadata newsletter_id=%s article_id=%s err=%s",
+                    newsletter_id,
+                    article_id,
+                    exc,
+                )
+
+        updated_articles.append(item)
+
+    if missing_preview_rows:
+        raise RuntimeError(
+            "preview article sync missing rows for draft indices "
+            + ", ".join(str(value) for value in missing_preview_rows)
+        )
+    return updated_articles
+
+
 def _mark_articles_pending_approval(articles: list[dict[str, Any]]) -> list[dict[str, Any]]:
     requested_at = datetime.now(tz=timezone.utc).isoformat()
     out: list[dict[str, Any]] = []
@@ -2580,6 +3217,8 @@ def process_single_newsletter(cfg: Config, newsletter_id: int, raw_html: str) ->
 
     cleaned = clean_html(raw_html)
 
+    email_segment_articles = _extract_articles_from_email_html(cfg, raw_html)
+
     # -- Audit: guardar output do clean_html antes de qualquer manipulação --
     try:
         audit_dir = Path(cfg.review_output_dir)
@@ -2589,28 +3228,34 @@ def process_single_newsletter(cfg: Config, newsletter_id: int, raw_html: str) ->
     except Exception as exc:
         LOG.warning("audit: failed to save cleaned text newsletter_id=%s err=%s", newsletter_id, exc)
 
-    link_articles, link_text = _extract_articles_from_primary_link(cleaned)
-    if link_articles:
+    link_articles: list[dict[str, Any]] = []
+    link_text = ""
+    if email_segment_articles:
         newsletter_type = "digest"
-        articles = link_articles
+        articles = email_segment_articles
     else:
-        # If link extraction did not produce sections, enrich prompt context with fetched page text when available.
-        llm_source_text = cleaned
-        if link_text:
-            llm_source_text = f"{cleaned}\n\n--- RESOLVED LINK CONTENT ---\n{link_text}"
+        link_articles, link_text = _extract_articles_from_primary_link(cleaned)
+        if link_articles:
+            newsletter_type = "digest"
+            articles = link_articles
+        else:
+            # If link extraction did not produce sections, enrich prompt context with fetched page text when available.
+            llm_source_text = cleaned
+            if link_text:
+                llm_source_text = f"{cleaned}\n\n--- RESOLVED LINK CONTENT ---\n{link_text}"
 
-        # -- Audit: guardar o texto final entregue ao Ollama --
-        try:
-            audit_dir = Path(cfg.review_output_dir)
-            audit_dir.mkdir(parents=True, exist_ok=True)
-            (audit_dir / f"newsletter_{newsletter_id}_llm_source_text.txt").write_text(llm_source_text, encoding="utf-8")
-            LOG.info("audit: saved llm_source_text newsletter_id=%s chars=%s", newsletter_id, len(llm_source_text))
-        except Exception as exc:
-            LOG.warning("audit: failed to save llm_source_text newsletter_id=%s err=%s", newsletter_id, exc)
+            # -- Audit: guardar o texto final entregue ao Ollama --
+            try:
+                audit_dir = Path(cfg.review_output_dir)
+                audit_dir.mkdir(parents=True, exist_ok=True)
+                (audit_dir / f"newsletter_{newsletter_id}_llm_source_text.txt").write_text(llm_source_text, encoding="utf-8")
+                LOG.info("audit: saved llm_source_text newsletter_id=%s chars=%s", newsletter_id, len(llm_source_text))
+            except Exception as exc:
+                LOG.warning("audit: failed to save llm_source_text newsletter_id=%s err=%s", newsletter_id, exc)
 
-        newsletter_type = classify_newsletter(cfg, llm_source_text[:2000])
-        # Apply truncation here to avoid LLM timeouts with massive prompts
-        articles = extract_articles(cfg, llm_source_text[:12000], newsletter_type)
+            newsletter_type = classify_newsletter(cfg, llm_source_text[:2000])
+            # Apply truncation here to avoid LLM timeouts with massive prompts
+            articles = extract_articles(cfg, llm_source_text[:12000], newsletter_type)
 
     subject_hint = _extract_forwarded_subject_hint(raw_html)
     anchor_candidates = _extract_email_anchor_candidates(raw_html)
@@ -2644,6 +3289,40 @@ def process_single_newsletter(cfg: Config, newsletter_id: int, raw_html: str) ->
     review_path = _write_review_bundle(cfg, newsletter_id, newsletter_type, enriched, cfg.llm_backend)
 
     if cfg.require_manual_article_approval or cfg.review_before_publish or manual_review_required > 0:
+        try:
+            enriched = _sync_review_articles_to_portal(cfg, newsletter_id, enriched)
+            review_path = _write_review_bundle(cfg, newsletter_id, newsletter_type, enriched, cfg.llm_backend)
+        except Exception as exc:
+            message = f"Review queue sync failed: {exc}"
+            _api_post(
+                cfg,
+                "newsletter/status/",
+                {
+                    "newsletter_id": newsletter_id,
+                    "status": "error",
+                    "error_message": message,
+                },
+            )
+            _api_post(
+                cfg,
+                "log/",
+                {
+                    "newsletter_id": newsletter_id,
+                    "action": "pipeline",
+                    "status": "error",
+                    "message": message,
+                    "duration_seconds": round(time.time() - started, 3),
+                },
+            )
+            return {
+                "status": "error",
+                "newsletter_id": newsletter_id,
+                "articles_created": len(enriched),
+                "review_file": review_path,
+                "manual_review_required": manual_review_required,
+                "error": message,
+            }
+
         review_message = "Draft ready for article-by-article approval"
         if manual_review_required > 0:
             review_message = (

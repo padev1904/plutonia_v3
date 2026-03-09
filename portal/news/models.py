@@ -63,7 +63,7 @@ class Newsletter(models.Model):
             ("processing", "Processing"),
             ("review", "Review"),
             ("completed", "Completed"),
-            ("eliminada_pos_publicada", "Eliminada_Pós_Publicada"),
+            ("eliminada_pos_publicada", "Eliminada_PÃ³s_Publicada"),
             ("error", "Error"),
         ],
         default="pending",
@@ -221,6 +221,10 @@ class Article(models.Model):
     def source_name(self) -> str:
         return _host_source_name(self.original_url, fallback=self.newsletter.sender_name)
 
+    @property
+    def original_publication_date(self):
+        return self.published_at or self.newsletter.original_sent_at or self.newsletter.received_at
+
 
 class Resource(models.Model):
     title = models.CharField(max_length=500)
@@ -269,6 +273,10 @@ class Resource(models.Model):
     @property
     def source_name(self) -> str:
         return _host_source_name(self.resource_url)
+
+    @property
+    def original_publication_date(self):
+        return self.source_published_at or self.published_at
 
 
 class ProcessingLog(models.Model):

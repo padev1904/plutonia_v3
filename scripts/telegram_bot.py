@@ -243,6 +243,18 @@ def _format_status_row(row: dict[str, Any]) -> str:
     return f"#{newsletter_id} uid={uid} {subject}"
 
 
+def _format_action_timestamp(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return "n/a"
+    if "T" in raw:
+        raw = raw.split("T", 1)[1]
+    raw = raw.split("+", 1)[0].split("Z", 1)[0]
+    if "." in raw:
+        raw = raw.split(".", 1)[0]
+    return raw or "n/a"
+
+
 def _format_pipeline_status_message(payload: dict[str, Any]) -> str:
     observed_at = str(payload.get("observed_at", "")).strip() or "n/a"
     counts = payload.get("counts", {}) if isinstance(payload, dict) else {}
@@ -314,7 +326,7 @@ def _format_pipeline_status_message(payload: dict[str, Any]) -> str:
             if not isinstance(action, dict):
                 continue
             lines.append(
-                f"- {str(action.get('at', ''))[-9:-1] or action.get('at', 'n/a')} "
+                f"- {_format_action_timestamp(action.get('at'))} "
                 f"{action.get('type', 'acao')}: {action.get('message', '')}"
             )
 

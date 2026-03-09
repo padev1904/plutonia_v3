@@ -81,6 +81,7 @@ WATCHDOG_NOTIFY_MIN_INTERVAL_SECONDS = 300
 WATCHDOG_DISK_FREE_ALERT_PCT = 5.0
 WATCHDOG_ACTION_HISTORY_LIMIT = 20
 WATCHDOG_WORKER_STALE_SECONDS = 90
+WATCHDOG_COMPLETED_LABEL_SYNC_INTERVAL_SECONDS = 120
 WATCHDOG_STATUS_FILE = "/review/ops_watchdog_status.json"
 
 _PROCESS_NEXT_PENDING_LOCK = threading.Lock()
@@ -89,6 +90,7 @@ _RUNTIME_STATE: dict[str, Any] = {
     "worker_heartbeats": {},
     "last_actions": [],
     "last_notifications": {},
+    "last_label_sync": {},
     "restart_request": None,
 }
 
@@ -102,6 +104,7 @@ def _refresh_watchdog_settings() -> None:
     global WATCHDOG_DISK_FREE_ALERT_PCT
     global WATCHDOG_ACTION_HISTORY_LIMIT
     global WATCHDOG_WORKER_STALE_SECONDS
+    global WATCHDOG_COMPLETED_LABEL_SYNC_INTERVAL_SECONDS
     global WATCHDOG_STATUS_FILE
 
     WATCHDOG_ENABLED = _is_truthy(os.getenv("PIPELINE_WATCHDOG_ENABLED", "1"))
@@ -112,6 +115,10 @@ def _refresh_watchdog_settings() -> None:
     WATCHDOG_DISK_FREE_ALERT_PCT = float(os.getenv("PIPELINE_WATCHDOG_DISK_FREE_ALERT_PCT", "5"))
     WATCHDOG_ACTION_HISTORY_LIMIT = max(5, int(os.getenv("PIPELINE_WATCHDOG_ACTION_HISTORY_LIMIT", "20")))
     WATCHDOG_WORKER_STALE_SECONDS = max(45, int(os.getenv("PIPELINE_WATCHDOG_WORKER_STALE_SECONDS", "90")))
+    WATCHDOG_COMPLETED_LABEL_SYNC_INTERVAL_SECONDS = max(
+        30,
+        int(os.getenv("PIPELINE_WATCHDOG_COMPLETED_LABEL_SYNC_INTERVAL_SECONDS", "120")),
+    )
     WATCHDOG_STATUS_FILE = os.getenv("WATCHDOG_STATUS_FILE", "/review/ops_watchdog_status.json").strip() or "/review/ops_watchdog_status.json"
 
 
@@ -179,6 +186,7 @@ def _runtime_snapshot() -> dict[str, Any]:
         return {
             "worker_heartbeats": json.loads(json.dumps(_RUNTIME_STATE.get("worker_heartbeats", {}))),
             "last_actions": json.loads(json.dumps(_RUNTIME_STATE.get("last_actions", []))),
+            "last_label_sync": json.loads(json.dumps(_RUNTIME_STATE.get("last_label_sync", {}))),
             "restart_request": json.loads(json.dumps(_RUNTIME_STATE.get("restart_request"))),
         }
 
@@ -240,6 +248,81 @@ def _pop_restart_request() -> dict[str, Any] | None:
         request = _RUNTIME_STATE.get("restart_request")
         _RUNTIME_STATE["restart_request"] = None
     return request if isinstance(request, dict) else None
+
+
+def _should_run_watchdog_label_sync(status: str, *, interval_seconds: int) -> bool:
+    key = str(status or "").strip().lower()
+    if not key:
+        return False
+    now_ts = time.time()
+    with _RUNTIME_STATE_LOCK:
+        sync_map = _RUNTIME_STATE.setdefault("last_label_sync", {})
+        last_ts = float(sync_map.get(key, 0.0) or 0.0)
+        if interval_seconds > 0 and (now_ts - last_ts) < interval_seconds:
+            return False
+        sync_map[key] = now_ts
+    return True
+
+
+def _watchdog_reconcile_gmail_labels(
+    cfg: Config,
+    *,
+    review_count: int,
+    completed_count: int,
+) -> list[dict[str, Any]]:
+    sync_runs: list[dict[str, Any]] = []
+
+    if review_count > 0 and _should_run_watchdog_label_sync("review", interval_seconds=0):
+        summary = _sync_status_gmail_labels(cfg, status="review", mode="oldest", limit=max(1, review_count))
+        sync_runs.append(summary)
+        changed = int(summary.get("changed", 0) or 0)
+        errors = summary.get("errors", []) if isinstance(summary, dict) else []
+        if changed:
+            _record_runtime_action(
+                "gmail_label_reconciled",
+                "Watchdog reconciled gmail labels for review newsletters",
+                status="review",
+                changed=changed,
+                synced=int(summary.get("synced", 0) or 0),
+            )
+        if errors:
+            _record_runtime_action(
+                "gmail_label_sync_error",
+                "Watchdog label reconciliation failed for review newsletters",
+                status="review",
+                error_count=len(errors),
+            )
+
+    if completed_count > 0 and _should_run_watchdog_label_sync(
+        "completed",
+        interval_seconds=WATCHDOG_COMPLETED_LABEL_SYNC_INTERVAL_SECONDS,
+    ):
+        summary = _sync_status_gmail_labels(
+            cfg,
+            status="completed",
+            mode="oldest",
+            limit=min(max(1, completed_count), 100),
+        )
+        sync_runs.append(summary)
+        changed = int(summary.get("changed", 0) or 0)
+        errors = summary.get("errors", []) if isinstance(summary, dict) else []
+        if changed:
+            _record_runtime_action(
+                "gmail_label_reconciled",
+                "Watchdog reconciled gmail labels for completed newsletters",
+                status="completed",
+                changed=changed,
+                synced=int(summary.get("synced", 0) or 0),
+            )
+        if errors:
+            _record_runtime_action(
+                "gmail_label_sync_error",
+                "Watchdog label reconciliation failed for completed newsletters",
+                status="completed",
+                error_count=len(errors),
+            )
+
+    return sync_runs
 
 
 def _fetch_newsletter_status_page(
@@ -624,9 +707,36 @@ def _pipeline_watchdog_worker(
                         ),
                     )
 
+            try:
+                label_sync = _watchdog_reconcile_gmail_labels(
+                    cfg,
+                    review_count=len(review_rows),
+                    completed_count=len(observed["current"].get("completed", [])),
+                )
+            except Exception as exc:
+                blockers.append({
+                    "type": "gmail_label_sync_failed",
+                    "error": str(exc),
+                })
+                _record_runtime_action(
+                    "gmail_label_sync_error",
+                    "Watchdog label reconciliation failed",
+                    error=str(exc),
+                )
+                _notify_watchdog(
+                    cfg,
+                    "gmail_label_sync_failed",
+                    _format_watchdog_event(
+                        "Watchdog: gmail label reconciliation failed",
+                        [f"error={exc}"],
+                    ),
+                )
+                label_sync = []
+
             payload = {
                 **observed,
                 "blockers": blockers,
+                "label_sync": label_sync,
                 "runtime": _runtime_snapshot(),
             }
             _write_watchdog_status(cfg, payload)

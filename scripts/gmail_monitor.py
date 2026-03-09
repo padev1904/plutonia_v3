@@ -278,19 +278,42 @@ def _watchdog_reconcile_gmail_labels(
         changed = int(summary.get("changed", 0) or 0)
         errors = summary.get("errors", []) if isinstance(summary, dict) else []
         if changed:
-            _record_runtime_action(
+            action = _record_runtime_action(
                 "gmail_label_reconciled",
                 "Watchdog reconciled gmail labels for review newsletters",
                 status="review",
                 changed=changed,
                 synced=int(summary.get("synced", 0) or 0),
             )
+            _notify_watchdog(
+                cfg,
+                f"gmail_label_reconciled:review:{action['at']}",
+                _format_watchdog_event(
+                    "Watchdog: gmail labels reconciled",
+                    [
+                        "status=review",
+                        f"changed={changed}",
+                        f"synced={int(summary.get('synced', 0) or 0)}",
+                    ],
+                ),
+            )
         if errors:
-            _record_runtime_action(
+            action = _record_runtime_action(
                 "gmail_label_sync_error",
                 "Watchdog label reconciliation failed for review newsletters",
                 status="review",
                 error_count=len(errors),
+            )
+            _notify_watchdog(
+                cfg,
+                f"gmail_label_sync_error:review:{action['at']}",
+                _format_watchdog_event(
+                    "Watchdog: gmail label reconciliation reported errors",
+                    [
+                        "status=review",
+                        f"error_count={len(errors)}",
+                    ],
+                ),
             )
 
     if completed_count > 0 and _should_run_watchdog_label_sync(
@@ -307,19 +330,42 @@ def _watchdog_reconcile_gmail_labels(
         changed = int(summary.get("changed", 0) or 0)
         errors = summary.get("errors", []) if isinstance(summary, dict) else []
         if changed:
-            _record_runtime_action(
+            action = _record_runtime_action(
                 "gmail_label_reconciled",
                 "Watchdog reconciled gmail labels for completed newsletters",
                 status="completed",
                 changed=changed,
                 synced=int(summary.get("synced", 0) or 0),
             )
+            _notify_watchdog(
+                cfg,
+                f"gmail_label_reconciled:completed:{action['at']}",
+                _format_watchdog_event(
+                    "Watchdog: gmail labels reconciled",
+                    [
+                        "status=completed",
+                        f"changed={changed}",
+                        f"synced={int(summary.get('synced', 0) or 0)}",
+                    ],
+                ),
+            )
         if errors:
-            _record_runtime_action(
+            action = _record_runtime_action(
                 "gmail_label_sync_error",
                 "Watchdog label reconciliation failed for completed newsletters",
                 status="completed",
                 error_count=len(errors),
+            )
+            _notify_watchdog(
+                cfg,
+                f"gmail_label_sync_error:completed:{action['at']}",
+                _format_watchdog_event(
+                    "Watchdog: gmail label reconciliation reported errors",
+                    [
+                        "status=completed",
+                        f"error_count={len(errors)}",
+                    ],
+                ),
             )
 
     return sync_runs
@@ -515,6 +561,10 @@ def _pipeline_watchdog_worker(
             pending_row, pending_age = _update_stuck_tracker(tracker, "pending", pending_rows, now_ts)
             processing_row, processing_age = _update_stuck_tracker(tracker, "processing", processing_rows, now_ts)
 
+            ingest_heartbeat = _worker_heartbeat_snapshot("ingest")
+            ingest_heartbeat_age = _heartbeat_age_seconds(ingest_heartbeat.get("at"))
+            ingest_heartbeat_state = str(ingest_heartbeat.get("state", "")).strip()
+
             process_heartbeat = _worker_heartbeat_snapshot("process")
             process_heartbeat_age = _heartbeat_age_seconds(process_heartbeat.get("at"))
             process_heartbeat_state = str(process_heartbeat.get("state", "")).strip()
@@ -623,6 +673,43 @@ def _pipeline_watchdog_worker(
                             ],
                         ),
                     )
+
+            if (
+                ingest_heartbeat_age is not None
+                and ingest_heartbeat_age >= WATCHDOG_WORKER_STALE_SECONDS
+                and not pending_rows
+                and not processing_rows
+                and not review_rows
+            ):
+                stalled_blocker = {
+                    "type": "ingest_worker_stalled",
+                    "age_seconds": round(ingest_heartbeat_age, 1),
+                    "heartbeat_state": ingest_heartbeat_state or "unknown",
+                }
+                blockers.append(stalled_blocker)
+                restart_request = _request_monitor_restart(
+                    "ingest_worker_stalled",
+                    heartbeat_age_seconds=round(ingest_heartbeat_age, 1),
+                    heartbeat_state=ingest_heartbeat_state or "unknown",
+                )
+                _record_runtime_action(
+                    "monitor_restart_requested",
+                    "Requested monitor restart after stalled ingest worker",
+                    reason=restart_request.get("reason"),
+                    heartbeat_age_seconds=restart_request.get("heartbeat_age_seconds"),
+                )
+                _notify_watchdog(
+                    cfg,
+                    f"monitor_restart_requested:{restart_request.get('reason')}:{restart_request.get('at')}",
+                    _format_watchdog_event(
+                        "Watchdog: monitor restart requested",
+                        [
+                            f"reason={restart_request.get('reason')}",
+                            f"heartbeat_age={restart_request.get('heartbeat_age_seconds')}s state={restart_request.get('heartbeat_state')}",
+                            "action=restart_monitor_for_stalled_ingest_worker",
+                        ],
+                    ),
+                )
 
             if (
                 process_heartbeat_age is not None
@@ -2420,10 +2507,18 @@ def run_monitor_parallel_mode(cfg: Config, gmail_address: str, gmail_app_passwor
                 raise RuntimeError("pipeline watchdog stopped unexpectedly")
             if telegram_bot_active and telegram_bot_thread and not telegram_bot_thread.is_alive():
                 LOG.warning("telegram bot thread died; restarting")
-                _record_runtime_action("telegram_bot_restart", "Telegram bot thread restarted")
+                action = _record_runtime_action("telegram_bot_restart", "Telegram bot thread restarted")
                 telegram_bot_thread, telegram_bot_active = _start_telegram_bot_thread(cfg)
                 if telegram_bot_active:
                     REVIEW_TELEGRAM_NOTIFY = False
+                    _notify_watchdog(
+                        cfg,
+                        f"telegram_bot_restart:{action['at']}",
+                        _format_watchdog_event(
+                            "Watchdog: Telegram bot restarted",
+                            ["action=restart_telegram_bot_thread"],
+                        ),
+                    )
             time.sleep(PARALLEL_MAIN_HEARTBEAT_SECONDS)
     except KeyboardInterrupt:
         stop_event.set()

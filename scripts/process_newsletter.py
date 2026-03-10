@@ -1086,6 +1086,62 @@ def _extract_published_at_from_soup(soup: BeautifulSoup, source_url: str) -> str
     return _extract_published_at_from_url(source_url)
 
 
+def _same_effective_url(left: str, right: str) -> bool:
+    left_norm = _normalize_url(left)
+    right_norm = _normalize_url(right)
+    if not left_norm or not right_norm:
+        return False
+    try:
+        left_parsed = urlparse(left_norm)
+        right_parsed = urlparse(right_norm)
+    except Exception:
+        return left_norm.rstrip("/") == right_norm.rstrip("/")
+
+    left_host = (left_parsed.hostname or "").lower().strip(".")
+    right_host = (right_parsed.hostname or "").lower().strip(".")
+    left_path = (left_parsed.path or "").rstrip("/")
+    right_path = (right_parsed.path or "").rstrip("/")
+    return left_host == right_host and left_path == right_path
+
+
+def _fallback_published_at_via_searxng(source_url: str, searxng_url: str) -> str:
+    normalized_source = _normalize_url(source_url)
+    base = str(searxng_url or "").strip()
+    if not normalized_source or not base:
+        return ""
+
+    try:
+        resp = requests.get(
+            f"{base.rstrip('/')}/search",
+            params={"q": normalized_source, "format": "json"},
+            headers=HTTP_HEADERS,
+            timeout=12,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:
+        LOG.warning("searxng source date fallback failed url=%s err=%s", normalized_source, exc)
+        return ""
+
+    results = data.get("results", []) if isinstance(data, dict) else []
+    if not isinstance(results, list):
+        return ""
+
+    for row in results:
+        if not isinstance(row, dict):
+            continue
+        candidate_url = _normalize_url(str(row.get("url") or row.get("link") or "").strip())
+        if not candidate_url:
+            continue
+        if not _same_effective_url(candidate_url, normalized_source):
+            continue
+        for field_name in ("publishedDate", "published_date"):
+            normalized = _normalize_datetime(str(row.get(field_name, "")).strip())
+            if normalized:
+                return normalized
+    return ""
+
+
 def _resolve_relative_url(url: str, base_url: str) -> str:
     value = _normalize_url(url)
     if not value:
@@ -1266,7 +1322,7 @@ def _get_source_image(url: str) -> str:
     return value
 
 
-def _resolve_source_metadata(url: str) -> tuple[str, str, str]:
+def _resolve_source_metadata(url: str, *, searxng_url: str = "") -> tuple[str, str, str]:
     normalized = _normalize_url(url)
     if not normalized:
         return "", "", ""
@@ -1293,17 +1349,22 @@ def _resolve_source_metadata(url: str) -> tuple[str, str, str]:
                 return SOURCE_META_CACHE[normalized]
 
         published_at = _extract_published_at_from_soup(soup, final_url)
+        if not published_at:
+            published_at = _fallback_published_at_via_searxng(final_url, searxng_url)
         image_url = _extract_image_from_soup(soup, final_url)
         SOURCE_META_CACHE[normalized] = (final_url, published_at, image_url)
         return SOURCE_META_CACHE[normalized]
     except Exception as exc:
         LOG.warning("source resolution failed url=%s err=%s", normalized, exc)
 
-    SOURCE_META_CACHE[normalized] = (resolved_url, _extract_published_at_from_url(resolved_url), "")
+    fallback_published_at = _extract_published_at_from_url(resolved_url)
+    if not fallback_published_at:
+        fallback_published_at = _fallback_published_at_via_searxng(resolved_url, searxng_url)
+    SOURCE_META_CACHE[normalized] = (resolved_url, fallback_published_at, "")
     return SOURCE_META_CACHE[normalized]
 
 
-def _apply_source_metadata(article: dict[str, Any]) -> dict[str, Any]:
+def _apply_source_metadata(article: dict[str, Any], cfg: Config | None = None) -> dict[str, Any]:
     result = dict(article)
     original_url = _normalize_url(str(result.get("original_url", "")).strip())
     if not original_url:
@@ -1322,7 +1383,10 @@ def _apply_source_metadata(article: dict[str, Any]) -> dict[str, Any]:
         )
         return _taxonomy_defaults(result)
 
-    source_url, published_at, source_image_url = _resolve_source_metadata(original_url)
+    source_url, published_at, source_image_url = _resolve_source_metadata(
+        original_url,
+        searxng_url=(cfg.searxng_url if cfg is not None else os.getenv("SEARXNG_URL", "http://searxng:8080")),
+    )
     resolved_source = source_url or _rewrite_medium_url(original_url)
     intermediate_url = ""
     if _looks_like_medium_post(original_url):
@@ -2781,7 +2845,7 @@ def _attach_discovered_source_before_review(cfg: Config, article: dict[str, Any]
     # Mark inferred source and retry source rewrite before sending review request.
     out["original_url"] = selected_url
     out["source_origin"] = "inferred"
-    out = _apply_source_metadata(out)
+    out = _apply_source_metadata(out, cfg)
     out["source_origin"] = "inferred"
     out = rewrite_article_from_source(cfg, out)
     out["source_origin"] = "inferred"
@@ -3489,7 +3553,7 @@ def process_single_newsletter(
             for article in articles
         ]
 
-    with_source = [_apply_source_metadata(article) for article in articles]
+    with_source = [_apply_source_metadata(article, cfg) for article in articles]
     rewritten = [rewrite_article_from_source(cfg, article) for article in with_source]
     enriched = [enrich_article(cfg, article) for article in rewritten]
     enriched = [_attach_discovered_source_before_review(cfg, article) for article in enriched]

@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import shlex
+import subprocess
 import threading
 import time
 import requests
@@ -1200,7 +1201,13 @@ def _is_imap_overquota_error(exc: BaseException) -> bool:
     return "OVERQUOTA" in text or "BANDWIDTH LIMITS" in text
 
 
-def fetch_all_inbox_emails(mail: imaplib.IMAP4_SSL, *, min_uid: int = 0, limit: int = 0) -> list[bytes]:
+def fetch_all_inbox_emails(
+    mail: imaplib.IMAP4_SSL,
+    *,
+    min_uid: int = 0,
+    limit: int = 0,
+    newest_first: bool = False,
+) -> list[bytes]:
     mail.select("INBOX")
     uid_values: list[bytes] = []
     min_uid_int = max(0, int(min_uid))
@@ -1222,7 +1229,7 @@ def fetch_all_inbox_emails(mail: imaplib.IMAP4_SSL, *, min_uid: int = 0, limit: 
     # Defensive guard:
     # Some IMAP servers (observed on Gmail) may return the boundary UID again
     # even when querying with UID <cursor+1>:*. Keep only strictly newer UIDs.
-    dedup = sorted({uid for uid in uid_values if uid}, key=_uid_to_int)
+    dedup = sorted({uid for uid in uid_values if uid}, key=_uid_to_int, reverse=bool(newest_first))
     filtered = [uid for uid in dedup if _uid_to_int(uid) > min_uid_int]
 
     excluded_labels = {_normalize_gmail_label(label) for label in GMAIL_EXCLUDED_LABELS if _normalize_gmail_label(label)}
@@ -1363,47 +1370,96 @@ def _load_ingest_cursor(cfg: Config) -> int:
         return 0
 
 
-def ingest_inbox(mail: imaplib.IMAP4_SSL, cfg: Config, *, limit: int | None = None) -> dict[str, int]:
+def ingest_inbox(
+    mail: imaplib.IMAP4_SSL,
+    cfg: Config,
+    *,
+    limit: int | None = None,
+    allow_backlog_scan: bool = True,
+) -> dict[str, int]:
     cursor_uid = _load_ingest_cursor(cfg)
     fetch_limit = INGEST_MAX_NEW_PER_CYCLE if limit is None else max(0, int(limit))
-    uids = fetch_all_inbox_emails(
+    scan_limit_recent = max(fetch_limit * 20, fetch_limit, 50) if fetch_limit > 0 else 0
+    recent_uids = fetch_all_inbox_emails(
         mail,
         min_uid=cursor_uid,
-        limit=(fetch_limit if fetch_limit > 0 else 0),
+        limit=scan_limit_recent,
+        newest_first=True,
     )
 
-    if uids:
+    if recent_uids:
         LOG.info(
-            "ingest window: cursor_uid=%s candidates=%s first_uid=%s last_uid=%s",
+            "ingest recent-first window: cursor_uid=%s candidates=%s newest_uid=%s oldest_uid=%s",
             cursor_uid,
-            len(uids),
-            uids[0].decode(errors="ignore"),
-            uids[-1].decode(errors="ignore"),
+            len(recent_uids),
+            recent_uids[0].decode(errors="ignore"),
+            recent_uids[-1].decode(errors="ignore"),
         )
 
     created = 0
     duplicate = 0
     failed = 0
+    scanned = 0
 
-    for uid in uids:
-        try:
-            payload = extract_email_header_data(mail, uid)
-            result = register_newsletter(cfg, payload)
-            status = str(result.get("status", "")).strip().lower()
-            if status == "created":
-                created += 1
-            else:
-                duplicate += 1
-        except Exception as exc:
-            failed += 1
-            LOG.warning("ingest failed uid=%s err=%s", uid.decode(errors="ignore"), exc)
-            if _is_imap_connection_error(exc):
-                LOG.warning("imap connection dropped during ingest; forcing reconnect")
-                raise
+    def _register_uid_batch(batch_name: str, uid_batch: list[bytes]) -> bool:
+        nonlocal created
+        nonlocal duplicate
+        nonlocal failed
+        nonlocal scanned
+
+        for uid in uid_batch:
+            if fetch_limit > 0 and created >= fetch_limit:
+                return True
+            try:
+                payload = extract_email_header_data(mail, uid)
+                result = register_newsletter(cfg, payload)
+                status = str(result.get("status", "")).strip().lower()
+                scanned += 1
+                if status == "created":
+                    created += 1
+                    LOG.info(
+                        "ingest accepted uid=%s source=%s created=%s/%s",
+                        uid.decode(errors="ignore"),
+                        batch_name,
+                        created,
+                        fetch_limit if fetch_limit > 0 else "inf",
+                    )
+                else:
+                    duplicate += 1
+            except Exception as exc:
+                failed += 1
+                LOG.warning("ingest failed uid=%s source=%s err=%s", uid.decode(errors="ignore"), batch_name, exc)
+                if _is_imap_connection_error(exc):
+                    LOG.warning("imap connection dropped during ingest; forcing reconnect")
+                    raise
+        return fetch_limit > 0 and created >= fetch_limit
+
+    stop_after_recent = _register_uid_batch("recent", recent_uids)
+
+    backlog_uids: list[bytes] = []
+    if allow_backlog_scan and not stop_after_recent and fetch_limit != 0:
+        backlog_scan_limit = max(fetch_limit * 50, fetch_limit, 200)
+        backlog_uids = fetch_all_inbox_emails(
+            mail,
+            min_uid=0,
+            limit=backlog_scan_limit,
+            newest_first=True,
+        )
+        if recent_uids:
+            recent_uid_keys = {uid for uid in recent_uids}
+            backlog_uids = [uid for uid in backlog_uids if uid not in recent_uid_keys]
+        if backlog_uids:
+            LOG.info(
+                "ingest backlog window: candidates=%s newest_uid=%s oldest_uid=%s",
+                len(backlog_uids),
+                backlog_uids[0].decode(errors="ignore"),
+                backlog_uids[-1].decode(errors="ignore"),
+            )
+        _register_uid_batch("backlog", backlog_uids)
 
     return {
-        "scanned": len(uids),
-        "available": len(uids),
+        "scanned": scanned,
+        "available": len(recent_uids) + len(backlog_uids),
         "cursor_uid": cursor_uid,
         "created": created,
         "duplicate": duplicate,
@@ -1752,10 +1808,35 @@ def _fetch_newsletter_workflow_state(cfg: Config, newsletter_id: int) -> dict[st
 
 
 def _has_active_newsletter_work(cfg: Config) -> bool:
+    # Active processing/review still gates processing decisions, but ingest
+    # should keep scanning for newer mail independently.
+    for status in ("review", "processing"):
+        if _fetch_newsletters_by_status(cfg, status, limit=1):
+            return True
+    return False
+
+
+def _has_queued_newsletter_work(cfg: Config) -> bool:
     for status in ("review", "processing", "pending"):
         if _fetch_newsletters_by_status(cfg, status, limit=1):
             return True
     return False
+
+
+def _resolve_manage_py_path() -> Path | None:
+    candidates = [
+        Path(__file__).resolve().parent.parent / "portal" / "manage.py",
+        Path("/app/manage.py"),
+        Path.cwd() / "portal" / "manage.py",
+        Path.cwd() / "manage.py",
+    ]
+    for candidate in candidates:
+        try:
+            if candidate.exists():
+                return candidate
+        except Exception:
+            continue
+    return None
 
 
 def _sync_newsletter_gmail_label(mail: imaplib.IMAP4_SSL, cfg: Config, newsletter_id: int) -> dict[str, Any]:
@@ -2027,7 +2108,7 @@ def _has_review_pending(cfg: Config) -> bool:
 
 
 def _fetch_next_pending(cfg: Config) -> dict[str, Any] | None:
-    rows = _fetch_newsletters_by_status(cfg, "pending", limit=1)
+    rows = _fetch_newsletters_by_status(cfg, "pending", limit=1, mode="latest")
     if not rows:
         return None
     return rows[0]
@@ -2118,7 +2199,7 @@ def _process_next_pending_unlocked(cfg: Config, mail: imaplib.IMAP4_SSL | None =
         return {"status": "error", "newsletter_id": newsletter_id, "error": "raw_html too short"}
 
     try:
-        result = process_single_newsletter(cfg, newsletter_id, raw_html)
+        result = process_single_newsletter(cfg, newsletter_id, raw_html, email_meta=raw_payload)
     except Exception as exc:
         LOG.exception("processing crash newsletter_id=%s", newsletter_id)
         _api_post(
@@ -2167,14 +2248,11 @@ def process_next_pending(cfg: Config, mail: imaplib.IMAP4_SSL | None = None) -> 
 
 
 def run_backlog_mode(mail: imaplib.IMAP4_SSL, cfg: Config) -> None:
-    if not _has_active_newsletter_work(cfg):
-        try:
-            _sync_status_gmail_labels(cfg, status="completed", mode="oldest", limit=100)
-        except Exception as exc:
-            LOG.warning("gmail label sync failed before backlog ingest err=%s", exc)
-        stats = ingest_inbox(mail, cfg, limit=1)
-    else:
-        stats = {"scanned": 0, "created": 0, "duplicate": 0, "failed": 0}
+    try:
+        _sync_status_gmail_labels(cfg, status="completed", mode="oldest", limit=100)
+    except Exception as exc:
+        LOG.warning("gmail label sync failed before backlog ingest err=%s", exc)
+    stats = ingest_inbox(mail, cfg, limit=1, allow_backlog_scan=not _has_queued_newsletter_work(cfg))
     LOG.info("ingest stats: scanned=%s created=%s duplicate=%s failed=%s", stats["scanned"], stats["created"], stats["duplicate"], stats["failed"])
 
     while True:
@@ -2213,15 +2291,12 @@ def run_backlog_mode(mail: imaplib.IMAP4_SSL, cfg: Config) -> None:
 def run_monitor_mode(mail: imaplib.IMAP4_SSL, cfg: Config) -> None:
     while True:
         try:
-            if _has_active_newsletter_work(cfg):
-                stats = {"scanned": 0, "created": 0, "duplicate": 0, "failed": 0}
-            else:
-                try:
-                    _sync_status_gmail_labels(cfg, status="completed", mode="oldest", limit=100)
-                except Exception as exc:
-                    LOG.warning("gmail label sync failed before monitor ingest err=%s", exc)
-                _mark_worker_heartbeat("ingest", "ingest_inbox")
-                stats = ingest_inbox(mail, cfg, limit=1)
+            try:
+                _sync_status_gmail_labels(cfg, status="completed", mode="oldest", limit=100)
+            except Exception as exc:
+                LOG.warning("gmail label sync failed before monitor ingest err=%s", exc)
+            _mark_worker_heartbeat("ingest", "ingest_inbox")
+            stats = ingest_inbox(mail, cfg, limit=1, allow_backlog_scan=not _has_queued_newsletter_work(cfg))
             LOG.info(
                 "ingest stats: scanned=%s created=%s duplicate=%s failed=%s",
                 stats["scanned"],
@@ -2304,15 +2379,11 @@ def _parallel_ingest_worker(
                 continue
 
         try:
-            if _has_active_newsletter_work(cfg):
-                _mark_worker_heartbeat("ingest", "gated_active_work")
-                _sleep_with_stop(stop_event, REVIEW_GATING_SLEEP_SECONDS)
-                continue
             try:
                 _sync_status_gmail_labels(cfg, status="completed", mode="oldest", limit=100)
             except Exception as exc:
                 LOG.warning("parallel ingest: gmail label sync failed err=%s", exc)
-            stats = ingest_inbox(mail, cfg, limit=1)
+            stats = ingest_inbox(mail, cfg, limit=1, allow_backlog_scan=not _has_queued_newsletter_work(cfg))
             LOG.info(
                 "parallel ingest stats: scanned=%s created=%s duplicate=%s failed=%s",
                 stats["scanned"],
@@ -2426,14 +2497,32 @@ def cleanup_zombie_tasks():
     LOG.info("Iniciando limpeza de segurança de tarefas zombie no arranque...")
     # Removido o filtro de tempo por falta do campo updated_at; 
     # No arranque, qualquer 'processing' é um resíduo de um crash anterior.
-    cmd = (
-        "python manage.py shell -c \""
-        "from news.models import Newsletter; "
-        "count = Newsletter.objects.filter(status='processing')"
-        ".update(status='error', error_message='Auto-recovered: Startup cleanup.'); "
-        "print(f'Zombies limpos: {count}')\" > /dev/null 2>&1"
-    )
-    os.system(cmd)
+    manage_py = _resolve_manage_py_path()
+    if manage_py is None:
+        LOG.warning("cleanup_zombie_tasks skipped: manage.py not found at %s", manage_py)
+        return
+    cmd = [
+        "python",
+        str(manage_py),
+        "shell",
+        "-c",
+        (
+            "from news.models import Newsletter; "
+            "count = Newsletter.objects.filter(status='processing')"
+            ".update(status='error', error_message='Auto-recovered: Startup cleanup.'); "
+            "print(f'Zombies limpos: {count}')"
+        ),
+    ]
+    try:
+        subprocess.run(
+            cmd,
+            cwd=str(manage_py.parent),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except Exception as exc:
+        LOG.warning("cleanup_zombie_tasks failed err=%s", exc)
 
 def _start_telegram_bot_thread(cfg: Config) -> tuple[threading.Thread | None, bool]:
     try:

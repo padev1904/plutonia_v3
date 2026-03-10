@@ -17,11 +17,12 @@ import json
 import logging
 import os
 import re
+import subprocess
 import time
 import unicodedata
 import uuid
 import urllib.parse
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from html import unescape
@@ -31,6 +32,7 @@ from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup, NavigableString, Tag
+from newsletter_revh_parser import ParsedArticle, parse_email_articles, unwrap as revh_unwrap
 
 try:
     import docker
@@ -388,6 +390,22 @@ OLLAMA_PARAMS = {
     "repeat_penalty": float(os.getenv("OLLAMA_REPEAT_PENALTY", "1.1")),
     "seed": int(os.getenv("OLLAMA_SEED", "42")),
 }
+
+
+def _resolve_manage_py_path() -> Path | None:
+    candidates = [
+        Path(__file__).resolve().parent.parent / "portal" / "manage.py",
+        Path("/app/manage.py"),
+        Path.cwd() / "portal" / "manage.py",
+        Path.cwd() / "manage.py",
+    ]
+    for candidate in candidates:
+        try:
+            if candidate.exists():
+                return candidate
+        except Exception:
+            continue
+    return None
 
 
 def _safe_json_array(text: str) -> list[dict[str, Any]]:
@@ -1645,7 +1663,155 @@ def _segment_article_with_llm(
     return article
 
 
-def _extract_articles_from_email_html(cfg: Config, raw_html: str) -> list[dict[str, Any]]:
+def _article_from_revh_candidate(
+    cfg: Config,
+    candidate: ParsedArticle,
+    *,
+    content_profile: str = "news",
+) -> dict[str, Any]:
+    segment_text = str(candidate.text or "").strip()
+    article = {
+        "title": str(candidate.title or "").strip()[:500],
+        "summary": _fallback_summary_from_text(segment_text),
+        "original_url": _normalize_url(str(candidate.source_link or "").strip()),
+        "categories": [],
+        "section": "",
+        "category": "",
+        "subcategory": "",
+        "content_profile": content_profile if content_profile in {"news", "resource"} else "news",
+        "raw_email_segment_text": segment_text,
+        "enrichment_context": segment_text,
+        "parser_backend": "revh",
+        "parser_family": str(candidate.family or "").strip(),
+        "parser_confidence": round(float(candidate.confidence or 0.0), 3),
+        "parser_notes": list(candidate.notes or []),
+        "parser_published_date_source": str(candidate.published_date_source or "").strip(),
+    }
+    if article["original_url"]:
+        article["source_origin"] = "direct_revh_parser"
+    if candidate.published_date:
+        article["published_at"] = candidate.published_date
+    article = _taxonomy_defaults(article)
+    if _title_needs_refinement(article.get("title")):
+        article["title"] = ""
+        article["title_origin"] = "needs_refinement"
+    if not _ensure_article_title(cfg, article, segment_text, content_profile=content_profile):
+        fallback_title = _fallback_title_from_text(segment_text) or "Untitled article"
+        article["title"] = fallback_title[:500]
+        article["manual_review_required"] = True
+        article.setdefault("review_note", "revH parser returned no reliable title for this email segment.")
+    return article
+
+
+def _should_use_revh_parse_result(parsed_articles: list[ParsedArticle]) -> bool:
+    if not parsed_articles:
+        return False
+    if len(parsed_articles) > 1:
+        return True
+    first = parsed_articles[0]
+    if str(first.family or "").strip().lower() != "generic":
+        return True
+    return bool(first.source_link) and float(first.confidence or 0.0) >= 0.70
+
+
+def _attach_email_segment_images(
+    articles: list[dict[str, Any]],
+    segments: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    used_indices: set[int] = set()
+    for article in articles:
+        item = dict(article)
+        article_url = _normalize_url(str(item.get("original_url", "")).strip())
+        article_title = str(item.get("title", "")).strip()
+        best_idx = -1
+        best_score = -1.0
+        for idx, segment in enumerate(segments):
+            if idx in used_indices:
+                continue
+            segment_url = _normalize_url(str(segment.get("original_url", "")).strip())
+            score = 0.0
+            if article_url and segment_url and article_url == segment_url:
+                score += 1000.0
+            if article_title:
+                score += _text_overlap_ratio(article_title, str(segment.get("full_text", ""))) * 100.0
+            if score > best_score:
+                best_score = score
+                best_idx = idx
+        if best_idx >= 0 and best_score >= 45.0:
+            matched = segments[best_idx]
+            used_indices.add(best_idx)
+            images = list(dict.fromkeys(str(url).strip() for url in matched.get("images", []) if str(url).strip()))
+            if images:
+                item["email_images"] = images
+                item.setdefault("image_url", images[0])
+            if not item.get("original_url"):
+                matched_url = _normalize_url(str(matched.get("original_url", "")).strip())
+                if matched_url:
+                    item["original_url"] = matched_url
+                    item["source_origin"] = "direct_email_parser"
+        out.append(item)
+    return out
+
+
+def _extract_article_email_images(raw_html: str, original_url: str, limit: int = 4) -> list[str]:
+    target_url = _normalize_url(str(original_url or "").strip())
+    if not raw_html or not target_url:
+        return []
+    try:
+        soup = BeautifulSoup(raw_html, "lxml")
+    except Exception:
+        return []
+
+    images: list[str] = []
+
+    def _add_from_container(container: Tag | None) -> None:
+        if not isinstance(container, Tag):
+            return
+        for img in container.find_all("img", recursive=True):
+            if len(images) >= limit:
+                return
+            if not _is_relevant_email_image(img):
+                continue
+            url = _normalize_email_image_url(str(img.get("src", "")))
+            if url and url not in images:
+                images.append(url)
+
+    for anchor in soup.find_all("a", href=True):
+        href = _normalize_url(str(anchor.get("href", "")).strip())
+        if not href:
+            continue
+        if revh_unwrap(href) != target_url and href != target_url:
+            continue
+        _add_from_container(anchor)
+        parent = anchor.parent if isinstance(anchor.parent, Tag) else None
+        _add_from_container(parent)
+        grandparent = parent.parent if isinstance(parent, Tag) and isinstance(parent.parent, Tag) else None
+        _add_from_container(grandparent)
+        if isinstance(parent, Tag):
+            for sibling in list(parent.find_previous_siblings(limit=2)) + list(parent.find_next_siblings(limit=2)):
+                _add_from_container(sibling)
+        if len(images) >= limit:
+            break
+    return images
+
+
+def _attach_email_images_from_html(articles: list[dict[str, Any]], raw_html: str) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for article in articles:
+        item = dict(article)
+        if item.get("email_images"):
+            out.append(item)
+            continue
+        images = _extract_article_email_images(raw_html, str(item.get("original_url", "")).strip())
+        if images:
+            item["email_images"] = images
+            item.setdefault("image_url", images[0])
+        out.append(item)
+    return out
+
+
+def _extract_email_segments_from_html(raw_html: str) -> list[dict[str, Any]]:
     if not raw_html:
         return []
 
@@ -1723,6 +1889,11 @@ def _extract_articles_from_email_html(cfg: Config, raw_html: str) -> list[dict[s
     if finalized is not None:
         segments.append(finalized)
 
+    return segments
+
+
+def _extract_articles_from_email_html(cfg: Config, raw_html: str) -> list[dict[str, Any]]:
+    segments = _extract_email_segments_from_html(raw_html)
     if len(segments) < 2:
         return []
 
@@ -3173,22 +3344,45 @@ def _mark_articles_pending_approval(articles: list[dict[str, Any]]) -> list[dict
     return out
 
 
-def process_single_newsletter(cfg: Config, newsletter_id: int, raw_html: str) -> dict[str, Any]:
+def process_single_newsletter(
+    cfg: Config,
+    newsletter_id: int,
+    raw_html: str,
+    *,
+    email_meta: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     started = time.time()
     # --- INÍCIO: Chave de Idempotência (Bloqueio de Duplicados) ---
     try:
-        import os
-        
-        # Usa o shell do Django para consultar a DB de forma segura
-        check_cmd = (
-            f"python manage.py shell -c \""
-            f"from news.models import Newsletter; "
-            f"n = Newsletter.objects.filter(id={newsletter_id}).first(); "
-            f"exists = Newsletter.objects.filter(original_sent_at=n.original_sent_at, original_sender_email=n.original_sender_email).exclude(id={newsletter_id}).exists() if (n and n.original_sent_at and n.original_sender_email) else False; "
-            f"print('DUPE' if exists else 'NO')\""
-        )
-        
-        if "DUPE" in os.popen(check_cmd).read():
+        manage_py = _resolve_manage_py_path()
+        duplicate_detected = False
+        if manage_py is not None:
+            result = subprocess.run(
+                [
+                    "python",
+                    str(manage_py),
+                    "shell",
+                    "-c",
+                    (
+                        "from news.models import Newsletter; "
+                        f"n = Newsletter.objects.filter(id={newsletter_id}).first(); "
+                        "exists = Newsletter.objects.filter("
+                        "original_sent_at=n.original_sent_at, "
+                        "original_sender_email=n.original_sender_email"
+                        ").exclude(id=n.id).exists() if (n and n.original_sent_at and n.original_sender_email) else False; "
+                        "print('DUPE' if exists else 'NO')"
+                    ),
+                ],
+                cwd=str(manage_py.parent),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            duplicate_detected = "DUPE" in (result.stdout or "")
+        else:
+            LOG.warning("Idempotency check skipped: manage.py not found at %s", manage_py)
+
+        if duplicate_detected:
             LOG.info("Idempotency Key: Duplicate content detected for ID=%s. Skipping.", newsletter_id)
             _api_post(
                 cfg,
@@ -3215,9 +3409,17 @@ def process_single_newsletter(cfg: Config, newsletter_id: int, raw_html: str) ->
         )
         return {"status": "error", "newsletter_id": newsletter_id, "articles_created": 0, "error": message}
 
+    meta = email_meta or {}
     cleaned = clean_html(raw_html)
-
-    email_segment_articles = _extract_articles_from_email_html(cfg, raw_html)
+    email_segments = _extract_email_segments_from_html(raw_html)
+    revh_result = parse_email_articles(raw_html, email_meta=meta)
+    revh_articles: list[dict[str, Any]] = []
+    if _should_use_revh_parse_result(revh_result.articles):
+        revh_articles = [_article_from_revh_candidate(cfg, row) for row in revh_result.articles]
+        if email_segments:
+            revh_articles = _attach_email_segment_images(revh_articles, email_segments)
+        revh_articles = _attach_email_images_from_html(revh_articles, raw_html)
+    email_segment_articles: list[dict[str, Any]] = []
 
     # -- Audit: guardar output do clean_html antes de qualquer manipulação --
     try:
@@ -3225,12 +3427,28 @@ def process_single_newsletter(cfg: Config, newsletter_id: int, raw_html: str) ->
         audit_dir.mkdir(parents=True, exist_ok=True)
         (audit_dir / f"newsletter_{newsletter_id}_cleaned.txt").write_text(cleaned, encoding="utf-8")
         LOG.info("audit: saved cleaned text newsletter_id=%s chars=%s", newsletter_id, len(cleaned))
+        revh_audit = {
+            "family": revh_result.family,
+            "skipped": bool(revh_result.skipped),
+            "skip_notes": list(revh_result.skip_notes or []),
+            "article_count": len(revh_result.articles),
+            "articles": [asdict(row) for row in revh_result.articles],
+        }
+        (audit_dir / f"newsletter_{newsletter_id}_revh_parse.json").write_text(
+            json.dumps(revh_audit, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        LOG.info("audit: saved revh parse newsletter_id=%s articles=%s family=%s", newsletter_id, len(revh_result.articles), revh_result.family)
     except Exception as exc:
         LOG.warning("audit: failed to save cleaned text newsletter_id=%s err=%s", newsletter_id, exc)
 
     link_articles: list[dict[str, Any]] = []
     link_text = ""
-    if email_segment_articles:
+    if revh_articles:
+        newsletter_type = "digest" if len(revh_articles) > 1 else "article"
+        articles = revh_articles
+    elif len(email_segments) >= 2:
+        email_segment_articles = [_segment_article_with_llm(cfg, segment) for segment in email_segments]
         newsletter_type = "digest"
         articles = email_segment_articles
     else:

@@ -80,6 +80,42 @@ NOISE_HOSTS = {
     "removepaywalls.com",
     "www.removepaywalls.com",
 }
+WEB_IMAGE_BLOCKED_PAGE_HOSTS = {
+    "x.com",
+    "twitter.com",
+    "facebook.com",
+    "instagram.com",
+    "linkedin.com",
+    "reddit.com",
+    "youtube.com",
+    "youtu.be",
+    "tiktok.com",
+    "pinterest.com",
+    "bing.com",
+    "duckduckgo.com",
+    "qwant.com",
+    "startpage.com",
+}
+WEB_IMAGE_BLOCKED_ASSET_HOSTS = {
+    "mm.bing.net",
+    "bing.com",
+    "duckduckgo.com",
+    "qwant.com",
+    "startpage.com",
+    "pinterest.com",
+}
+WEB_IMAGE_NOISE_TERMS = (
+    "logo",
+    "avatar",
+    "icon",
+    "favicon",
+    "profile",
+    "sprite",
+    "emoji",
+    "placeholder",
+    "default-image",
+    "default_image",
+)
 GENERIC_NAV_PATHS = {
     "",
     "/",
@@ -166,8 +202,10 @@ IMAGE_META_FIELDS: tuple[tuple[str, str, str], ...] = (
 SOURCE_META_CACHE: dict[str, tuple[str, str, str]] = {}
 PUBLISHED_AT_CACHE: dict[str, str] = {}
 IMAGE_URL_CACHE: dict[str, str] = {}
+IMAGE_PROBE_CACHE: dict[str, dict[str, Any]] = {}
 SOURCE_TEXT_CACHE: dict[str, str] = {}
 SOURCE_SNAPSHOT_CACHE: dict[str, dict[str, Any]] = {}
+WEB_IMAGE_SEARCH_CACHE: dict[str, dict[str, Any]] = {}
 _DOCKER_CLIENT: Any | None = None
 ANCHOR_NOISE_TEXT_RE = re.compile(
     r"(?:\bread online\b|\bview in browser\b|\bsign ?up\b|\bsubscribe\b|\badvertise\b|"
@@ -374,6 +412,9 @@ class Config:
     source_discovery_min_score: int = int(os.getenv("SOURCE_DISCOVERY_MIN_SCORE", "30"))
     source_presence_min_chars: int = int(os.getenv("SOURCE_PRESENCE_MIN_CHARS", "220"))
     source_title_overlap_min_ratio: float = float(os.getenv("SOURCE_TITLE_OVERLAP_MIN_RATIO", "0.35"))
+    web_image_search_enabled: bool = os.getenv("WEB_IMAGE_SEARCH_ENABLED", "true").strip().lower() in BOOL_TRUE
+    web_image_search_min_score: int = int(os.getenv("WEB_IMAGE_SEARCH_MIN_SCORE", "36"))
+    web_image_search_max_candidates: int = int(os.getenv("WEB_IMAGE_SEARCH_MAX_CANDIDATES", "6"))
     required_summary_model: str = os.getenv("REQUIRED_SUMMARY_MODEL", "qwen3:14b").strip()
     require_manual_article_approval: bool = os.getenv("REQUIRE_MANUAL_ARTICLE_APPROVAL", "true").strip().lower() in BOOL_TRUE
     # Per-task model configuration (Fase 6 — migrated from local agent)
@@ -1320,6 +1361,528 @@ def _get_source_image(url: str) -> str:
         value = ""
     IMAGE_URL_CACHE[normalized] = value
     return value
+
+
+def _host_matches_blocklist(host: str, blocked_hosts: set[str]) -> bool:
+    normalized_host = str(host or "").strip().lower().lstrip(".")
+    if not normalized_host:
+        return False
+    return any(normalized_host == blocked or normalized_host.endswith(f".{blocked}") for blocked in blocked_hosts)
+
+
+def _is_blocked_web_image_page(url: str) -> bool:
+    host = _normalized_host_from_url(url)
+    return _host_matches_blocklist(host, WEB_IMAGE_BLOCKED_PAGE_HOSTS)
+
+
+def _is_blocked_web_image_asset(url: str) -> bool:
+    normalized = _normalize_url(url)
+    if not normalized:
+        return True
+    host = _normalized_host_from_url(normalized)
+    if _host_matches_blocklist(host, WEB_IMAGE_BLOCKED_ASSET_HOSTS):
+        return True
+    lower = normalized.lower()
+    return any(term in lower for term in WEB_IMAGE_NOISE_TERMS)
+
+
+def _probe_image_url(url: str) -> dict[str, Any]:
+    normalized = _normalize_url(url)
+    if not normalized:
+        return {"ok": False, "url": "", "final_url": "", "content_type": "", "content_length": 0}
+
+    cached = IMAGE_PROBE_CACHE.get(normalized)
+    if cached is not None:
+        return cached
+
+    result = {
+        "ok": False,
+        "url": normalized,
+        "final_url": normalized,
+        "content_type": "",
+        "content_length": 0,
+    }
+    if _is_blocked_web_image_asset(normalized):
+        IMAGE_PROBE_CACHE[normalized] = result
+        return result
+
+    response: requests.Response | None = None
+    try:
+        response = requests.get(
+            normalized,
+            headers=HTTP_HEADERS,
+            allow_redirects=True,
+            timeout=15,
+            stream=True,
+        )
+        final_url = _normalize_url(str(response.url or "").strip()) or normalized
+        content_type = str(response.headers.get("Content-Type", "")).split(";", 1)[0].strip().lower()
+        try:
+            content_length = int(str(response.headers.get("Content-Length", "0")).strip() or 0)
+        except Exception:
+            content_length = 0
+        ok = bool(response.ok and content_type.startswith("image/"))
+        if ok and content_length and content_length < 5_000:
+            ok = False
+        result = {
+            "ok": ok,
+            "url": normalized,
+            "final_url": final_url,
+            "content_type": content_type,
+            "content_length": content_length,
+        }
+    except Exception:
+        pass
+    finally:
+        if response is not None:
+            response.close()
+
+    IMAGE_PROBE_CACHE[normalized] = result
+    final_url = _normalize_url(str(result.get("final_url", "")).strip())
+    if final_url and final_url != normalized:
+        IMAGE_PROBE_CACHE[final_url] = result
+    return result
+
+
+def _image_resolution_area(value: str) -> int:
+    raw = str(value or "").replace(chr(215), "x")
+    match = re.search(r"(\d{2,5})\s*x\s*(\d{2,5})", raw, flags=re.IGNORECASE)
+    if not match:
+        return 0
+    try:
+        width = int(match.group(1))
+        height = int(match.group(2))
+    except Exception:
+        return 0
+    return max(0, width) * max(0, height)
+
+
+def _content_length_bonus(content_length: int) -> int:
+    size = int(content_length or 0)
+    if size >= 250_000:
+        return 12
+    if size >= 100_000:
+        return 8
+    if size >= 40_000:
+        return 4
+    return 0
+
+
+def _web_image_search_cache_key(article: dict[str, Any]) -> str:
+    categories_raw = article.get("categories", []) or []
+    if not isinstance(categories_raw, list):
+        categories_raw = [categories_raw]
+    payload = {
+        "title": str(article.get("title", "")).strip(),
+        "summary": str(article.get("summary", "")).strip()[:300],
+        "article_body": str(article.get("article_body", "")).strip()[:800],
+        "enrichment_context": str(article.get("enrichment_context", "")).strip()[:800],
+        "original_url": _normalize_url(str(article.get("original_url", "")).strip()),
+        "categories": [str(v).strip() for v in categories_raw[:4] if str(v).strip()],
+        "source_name": str(article.get("source_name", "")).strip(),
+    }
+    return json.dumps(payload, sort_keys=True)
+
+
+def _article_has_resolved_image(article: dict[str, Any]) -> bool:
+    if _normalize_url(str(article.get("image_url", "")).strip()):
+        return True
+    if _normalize_url(str(article.get("source_image_url", "")).strip()):
+        return True
+    email_images = article.get("email_images", []) or []
+    if not isinstance(email_images, list):
+        email_images = [email_images]
+    for row in email_images:
+        if _normalize_url(str(row).strip()):
+            return True
+    return False
+
+
+def _build_web_image_queries(article: dict[str, Any]) -> list[str]:
+    title = _compact_text(str(article.get("title", "")).strip())
+    if not title:
+        return []
+
+    title_lower = title.lower()
+    queries: list[str] = [title]
+    source_name = _compact_text(str(article.get("source_name", "")).strip())
+    categories_raw = article.get("categories", []) or []
+    if not isinstance(categories_raw, list):
+        categories_raw = [categories_raw]
+    categories = [str(v).strip() for v in categories_raw if str(v).strip()]
+    extras: list[str] = []
+
+    if source_name and source_name.lower() not in title_lower:
+        queries.append(f"{title} {source_name}")
+
+    for category in categories[:3]:
+        compact = _compact_text(category)
+        if compact and compact.lower() not in title_lower and compact not in extras:
+            extras.append(compact)
+
+    text_blob = "\n".join(
+        [
+            str(article.get("summary", "")).strip(),
+            str(article.get("article_body", "")).strip()[:800],
+            str(article.get("enrichment_context", "")).strip()[:800],
+        ]
+    ).strip()
+    title_tokens = set(_tokenize_title_for_source_match(title))
+    for token in _tokenize_title_for_source_match(text_blob):
+        if token in title_tokens:
+            continue
+        if token in extras:
+            continue
+        if len(token) < 6:
+            continue
+        extras.append(token)
+        if len(extras) >= 4:
+            break
+
+    if extras:
+        queries.append(f"{title} {' '.join(extras[:2])}")
+    if source_name and extras:
+        queries.append(f"{title} {source_name} {extras[0]}")
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for query in queries:
+        compact = _compact_text(query)
+        if not compact:
+            continue
+        key = compact.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(compact)
+    return deduped[:4]
+
+
+def _searxng_search(cfg: Config, query: str, *, categories: str = "") -> list[dict[str, Any]]:
+    base = str(cfg.searxng_url or "").strip()
+    compact_query = _compact_text(query)
+    if not base or not compact_query:
+        return []
+
+    params = {"q": compact_query, "format": "json"}
+    if categories:
+        params["categories"] = categories
+
+    try:
+        resp = requests.get(
+            f"{base.rstrip('/')}/search",
+            params=params,
+            headers=HTTP_HEADERS,
+            timeout=12,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+    except Exception as exc:
+        LOG.warning("searxng query failed query=%r categories=%s err=%s", compact_query, categories or "general", exc)
+        return []
+
+    rows = payload.get("results", []) if isinstance(payload, dict) else []
+    if not isinstance(rows, list):
+        return []
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _score_web_image_page_result(
+    *,
+    article_title: str,
+    original_url: str,
+    page_url: str,
+    result_title: str,
+    snippet: str,
+) -> int:
+    normalized_page = _normalize_url(page_url)
+    if not normalized_page:
+        return -10_000
+    if _is_generic_source_url(normalized_page):
+        return -10_000
+    if _is_blocked_web_image_page(normalized_page):
+        return -10_000
+
+    score = _score_discovered_source_url(
+        article_title=article_title,
+        url=normalized_page,
+        result_title=result_title,
+        snippet=snippet,
+    )
+    if score <= -10_000:
+        return score
+
+    overlap_ratio = _text_overlap_ratio(article_title, f"{result_title}\n{snippet}")
+    score += int(overlap_ratio * 100)
+
+    preferred_host = _normalized_host_from_url(original_url)
+    candidate_host = _normalized_host_from_url(normalized_page)
+    if original_url and _same_effective_url(normalized_page, original_url):
+        score += 80
+    elif preferred_host and candidate_host == preferred_host:
+        score += 18
+    return score
+
+
+def _score_web_image_result(
+    *,
+    article_title: str,
+    original_url: str,
+    page_url: str,
+    image_url: str,
+    result_title: str,
+    snippet: str,
+    resolution: str,
+) -> int:
+    normalized_image = _normalize_url(image_url)
+    if not normalized_image or _is_blocked_web_image_asset(normalized_image):
+        return -10_000
+
+    normalized_page = _normalize_url(page_url)
+    if normalized_page and _is_blocked_web_image_page(normalized_page):
+        return -10_000
+
+    basis_url = normalized_page or normalized_image
+    score = _score_discovered_source_url(
+        article_title=article_title,
+        url=basis_url,
+        result_title=result_title,
+        snippet=snippet,
+    )
+    if score <= -10_000:
+        return score
+
+    overlap_ratio = _text_overlap_ratio(article_title, f"{result_title}\n{snippet}\n{normalized_page}")
+    score += int(overlap_ratio * 100)
+
+    preferred_host = _normalized_host_from_url(original_url)
+    candidate_host = _normalized_host_from_url(normalized_page)
+    if original_url and normalized_page and _same_effective_url(normalized_page, original_url):
+        score += 90
+    elif preferred_host and candidate_host == preferred_host:
+        score += 24
+
+    area = _image_resolution_area(resolution)
+    if area >= 1_200 * 630:
+        score += 16
+    elif area >= 800 * 420:
+        score += 10
+    elif area >= 500 * 260:
+        score += 4
+
+    noise_blob = f"{normalized_page}\n{normalized_image}\n{result_title}".lower()
+    if any(term in noise_blob for term in WEB_IMAGE_NOISE_TERMS):
+        score -= 40
+    return score
+
+
+def _find_web_image_from_search_pages(cfg: Config, article: dict[str, Any], queries: list[str]) -> dict[str, Any]:
+    title = _compact_text(str(article.get("title", "")).strip())
+    original_url = _normalize_url(str(article.get("original_url", "")).strip())
+    candidates: list[dict[str, Any]] = []
+    seen_pages: set[str] = set()
+
+    for query in queries:
+        rows = _searxng_search(cfg, query)
+        for row in rows[: max(1, cfg.web_image_search_max_candidates)]:
+            page_url = _normalize_url(str(row.get("url") or row.get("link") or "").strip())
+            if not page_url or page_url in seen_pages:
+                continue
+            seen_pages.add(page_url)
+
+            result_title = _compact_text(str(row.get("title", "")).strip())
+            snippet = _compact_text(str(row.get("content", "")).strip())
+            score = _score_web_image_page_result(
+                article_title=title,
+                original_url=original_url,
+                page_url=page_url,
+                result_title=result_title,
+                snippet=snippet,
+            )
+            if score < cfg.web_image_search_min_score:
+                continue
+
+            page_image_url = _get_source_image(page_url)
+            if not page_image_url or _is_blocked_web_image_asset(page_image_url):
+                continue
+
+            probe = _probe_image_url(page_image_url)
+            if not bool(probe.get("ok")):
+                continue
+
+            final_image_url = _normalize_url(str(probe.get("final_url", "")).strip()) or page_image_url
+            final_score = score + _content_length_bonus(int(probe.get("content_length", 0) or 0))
+            candidate = {
+                "query": query,
+                "page_url": page_url,
+                "image_url": final_image_url,
+                "score": final_score,
+                "title": result_title,
+                "strategy": "search_results_page_image",
+            }
+            if original_url and _same_effective_url(page_url, original_url):
+                return {
+                    "selected_url": str(candidate.get("image_url", "")).strip(),
+                    "selected_page_url": str(candidate.get("page_url", "")).strip(),
+                    "selected_score": int(candidate.get("score", 0) or 0),
+                    "query": str(candidate.get("query", "")).strip(),
+                    "strategy": str(candidate.get("strategy", "")).strip(),
+                    "candidates": [candidate],
+                }
+            candidates.append(candidate)
+
+    if not candidates:
+        return {}
+
+    candidates.sort(key=lambda row: int(row.get("score", 0) or 0), reverse=True)
+    best = candidates[0]
+    return {
+        "selected_url": str(best.get("image_url", "")).strip(),
+        "selected_page_url": str(best.get("page_url", "")).strip(),
+        "selected_score": int(best.get("score", 0) or 0),
+        "query": str(best.get("query", "")).strip(),
+        "strategy": str(best.get("strategy", "")).strip(),
+        "candidates": candidates[:5],
+    }
+
+
+def _find_web_image_from_image_results(cfg: Config, article: dict[str, Any], queries: list[str]) -> dict[str, Any]:
+    title = _compact_text(str(article.get("title", "")).strip())
+    original_url = _normalize_url(str(article.get("original_url", "")).strip())
+    candidates: list[dict[str, Any]] = []
+    seen_images: set[str] = set()
+
+    for query in queries:
+        rows = _searxng_search(cfg, query, categories="images")
+        for row in rows[: max(1, cfg.web_image_search_max_candidates)]:
+            page_url = _normalize_url(str(row.get("url") or row.get("link") or "").strip())
+            image_url = _normalize_url(str(row.get("img_src") or row.get("image") or "").strip())
+            if not image_url or image_url in seen_images:
+                continue
+            seen_images.add(image_url)
+
+            result_title = _compact_text(str(row.get("title", "")).strip())
+            snippet = _compact_text(str(row.get("content", "")).strip())
+            score = _score_web_image_result(
+                article_title=title,
+                original_url=original_url,
+                page_url=page_url,
+                image_url=image_url,
+                result_title=result_title,
+                snippet=snippet,
+                resolution=str(row.get("resolution", "")).strip(),
+            )
+            if score < cfg.web_image_search_min_score:
+                continue
+
+            probe = _probe_image_url(image_url)
+            if not bool(probe.get("ok")):
+                continue
+
+            final_image_url = _normalize_url(str(probe.get("final_url", "")).strip()) or image_url
+            final_score = score + _content_length_bonus(int(probe.get("content_length", 0) or 0))
+            candidate = {
+                "query": query,
+                "page_url": page_url,
+                "image_url": final_image_url,
+                "score": final_score,
+                "title": result_title,
+                "strategy": "search_results_image_asset",
+            }
+            if original_url and page_url and _same_effective_url(page_url, original_url):
+                return {
+                    "selected_url": str(candidate.get("image_url", "")).strip(),
+                    "selected_page_url": str(candidate.get("page_url", "")).strip(),
+                    "selected_score": int(candidate.get("score", 0) or 0),
+                    "query": str(candidate.get("query", "")).strip(),
+                    "strategy": str(candidate.get("strategy", "")).strip(),
+                    "candidates": [candidate],
+                }
+            candidates.append(candidate)
+
+    if not candidates:
+        return {}
+
+    candidates.sort(key=lambda row: int(row.get("score", 0) or 0), reverse=True)
+    best = candidates[0]
+    return {
+        "selected_url": str(best.get("image_url", "")).strip(),
+        "selected_page_url": str(best.get("page_url", "")).strip(),
+        "selected_score": int(best.get("score", 0) or 0),
+        "query": str(best.get("query", "")).strip(),
+        "strategy": str(best.get("strategy", "")).strip(),
+        "candidates": candidates[:5],
+    }
+
+
+def discover_web_image_for_article(cfg: Config, article: dict[str, Any]) -> dict[str, Any]:
+    if not cfg.web_image_search_enabled:
+        return {"attempted": False, "reason": "disabled", "selected_url": ""}
+    if _article_has_resolved_image(article):
+        return {"attempted": False, "reason": "existing_image", "selected_url": ""}
+
+    title = _compact_text(str(article.get("title", "")).strip())
+    if not title:
+        return {"attempted": False, "reason": "missing_title", "selected_url": ""}
+
+    cache_key = _web_image_search_cache_key(article)
+    cached = WEB_IMAGE_SEARCH_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    queries = _build_web_image_queries(article)
+    if not queries:
+        result = {"attempted": False, "reason": "missing_query", "selected_url": ""}
+        WEB_IMAGE_SEARCH_CACHE[cache_key] = result
+        return result
+
+    selection = _find_web_image_from_search_pages(cfg, article, queries)
+    if not selection:
+        selection = _find_web_image_from_image_results(cfg, article, queries)
+
+    if selection:
+        result = {
+            "attempted": True,
+            "reason": "ok",
+            "strategy": str(selection.get("strategy", "")).strip(),
+            "query": str(selection.get("query", "")).strip(),
+            "queries": queries,
+            "selected_url": str(selection.get("selected_url", "")).strip(),
+            "selected_page_url": str(selection.get("selected_page_url", "")).strip(),
+            "selected_score": int(selection.get("selected_score", 0) or 0),
+            "candidates": selection.get("candidates", []),
+        }
+    else:
+        result = {
+            "attempted": True,
+            "reason": "not_found",
+            "strategy": "",
+            "query": "",
+            "queries": queries,
+            "selected_url": "",
+            "selected_page_url": "",
+            "selected_score": 0,
+            "candidates": [],
+        }
+
+    WEB_IMAGE_SEARCH_CACHE[cache_key] = result
+    return result
+
+
+def _attach_web_image_fallback(cfg: Config, article: dict[str, Any]) -> dict[str, Any]:
+    item = dict(article)
+    discovery = discover_web_image_for_article(cfg, item)
+    if bool(discovery.get("attempted")):
+        item["image_search"] = discovery
+
+    selected_url = _normalize_url(str(discovery.get("selected_url", "")).strip())
+    if selected_url and not _article_has_resolved_image(item):
+        item["image_url"] = selected_url
+        item["image_origin"] = "web_search"
+        selected_page_url = _normalize_url(str(discovery.get("selected_page_url", "")).strip())
+        if selected_page_url:
+            item["image_source_page"] = selected_page_url
+    return item
 
 
 def _resolve_source_metadata(url: str, *, searxng_url: str = "") -> tuple[str, str, str]:
@@ -3557,6 +4120,7 @@ def process_single_newsletter(
     rewritten = [rewrite_article_from_source(cfg, article) for article in with_source]
     enriched = [enrich_article(cfg, article) for article in rewritten]
     enriched = [_attach_discovered_source_before_review(cfg, article) for article in enriched]
+    enriched = [_attach_web_image_fallback(cfg, article) for article in enriched]
     enriched = _mark_articles_pending_approval(enriched)
     manual_review_required = sum(1 for row in enriched if bool(row.get("manual_review_required")))
 

@@ -1885,6 +1885,24 @@ def _attach_web_image_fallback(cfg: Config, article: dict[str, Any]) -> dict[str
     return item
 
 
+def _prefer_source_published_at(cfg: Config, article: dict[str, Any]) -> dict[str, Any]:
+    item = dict(article)
+    source_published_at = _normalize_datetime(str(item.get("source_published_at", "")).strip())
+    original_url = _normalize_url(str(item.get("original_url", "")).strip())
+
+    if not source_published_at and original_url:
+        _, resolved_published_at, _ = _resolve_source_metadata(
+            original_url,
+            searxng_url=cfg.searxng_url,
+        )
+        source_published_at = _normalize_datetime(str(resolved_published_at or "").strip())
+
+    if source_published_at:
+        item["source_published_at"] = source_published_at
+        item["published_at"] = source_published_at
+    return item
+
+
 def _resolve_source_metadata(url: str, *, searxng_url: str = "") -> tuple[str, str, str]:
     normalized = _normalize_url(url)
     if not normalized:
@@ -1965,6 +1983,7 @@ def _apply_source_metadata(article: dict[str, Any], cfg: Config | None = None) -
     if source_name:
         result["source_name"] = source_name
     if published_at:
+        result["source_published_at"] = published_at
         result["published_at"] = published_at
     if source_image_url:
         result["source_image_url"] = source_image_url
@@ -4120,6 +4139,7 @@ def process_single_newsletter(
     rewritten = [rewrite_article_from_source(cfg, article) for article in with_source]
     enriched = [enrich_article(cfg, article) for article in rewritten]
     enriched = [_attach_discovered_source_before_review(cfg, article) for article in enriched]
+    enriched = [_prefer_source_published_at(cfg, article) for article in enriched]
     enriched = [_attach_web_image_fallback(cfg, article) for article in enriched]
     enriched = _mark_articles_pending_approval(enriched)
     manual_review_required = sum(1 for row in enriched if bool(row.get("manual_review_required")))

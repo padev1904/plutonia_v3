@@ -1823,6 +1823,22 @@ def _has_queued_newsletter_work(cfg: Config) -> bool:
     return False
 
 
+def _resolve_manage_py_path() -> Path | None:
+    candidates = [
+        Path(__file__).resolve().parent.parent / "portal" / "manage.py",
+        Path("/app/manage.py"),
+        Path.cwd() / "portal" / "manage.py",
+        Path.cwd() / "manage.py",
+    ]
+    for candidate in candidates:
+        try:
+            if candidate.exists():
+                return candidate
+        except Exception:
+            continue
+    return None
+
+
 def _sync_newsletter_gmail_label(mail: imaplib.IMAP4_SSL, cfg: Config, newsletter_id: int) -> dict[str, Any]:
     workflow = _fetch_newsletter_workflow_state(cfg, newsletter_id)
     uid_raw = str(workflow.get("gmail_uid", "")).strip()
@@ -2481,8 +2497,8 @@ def cleanup_zombie_tasks():
     LOG.info("Iniciando limpeza de segurança de tarefas zombie no arranque...")
     # Removido o filtro de tempo por falta do campo updated_at; 
     # No arranque, qualquer 'processing' é um resíduo de um crash anterior.
-    manage_py = Path(__file__).resolve().parent.parent / "portal" / "manage.py"
-    if not manage_py.exists():
+    manage_py = _resolve_manage_py_path()
+    if manage_py is None:
         LOG.warning("cleanup_zombie_tasks skipped: manage.py not found at %s", manage_py)
         return
     cmd = [

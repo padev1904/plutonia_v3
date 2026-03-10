@@ -392,6 +392,22 @@ OLLAMA_PARAMS = {
 }
 
 
+def _resolve_manage_py_path() -> Path | None:
+    candidates = [
+        Path(__file__).resolve().parent.parent / "portal" / "manage.py",
+        Path("/app/manage.py"),
+        Path.cwd() / "portal" / "manage.py",
+        Path.cwd() / "manage.py",
+    ]
+    for candidate in candidates:
+        try:
+            if candidate.exists():
+                return candidate
+        except Exception:
+            continue
+    return None
+
+
 def _safe_json_array(text: str) -> list[dict[str, Any]]:
     text = text.strip()
     if not text:
@@ -3338,9 +3354,9 @@ def process_single_newsletter(
     started = time.time()
     # --- INÍCIO: Chave de Idempotência (Bloqueio de Duplicados) ---
     try:
-        manage_py = Path(__file__).resolve().parent.parent / "portal" / "manage.py"
+        manage_py = _resolve_manage_py_path()
         duplicate_detected = False
-        if manage_py.exists():
+        if manage_py is not None:
             result = subprocess.run(
                 [
                     "python",

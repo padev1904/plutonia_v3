@@ -2664,6 +2664,46 @@ def _publication_destination_label(profile: str) -> str:
     return "News"
 
 
+def _resolve_preview_source_enrichment(cfg: Config, article: dict[str, Any], *, source_url: str) -> dict[str, Any]:
+    normalized_source = _normalize_url(source_url)
+    if not normalized_source:
+        return dict(article)
+
+    existing_image_url = _normalize_url(str(article.get("image_url", "")).strip())
+    enriched_article = dict(article)
+    enriched_article["original_url"] = normalized_source
+
+    try:
+        from process_newsletter import _apply_source_metadata, _attach_web_image_fallback
+
+        enriched_article = _apply_source_metadata(enriched_article, cfg)
+        source_image_url = _normalize_url(str(enriched_article.get("source_image_url", "")).strip())
+        if source_image_url:
+            enriched_article["image_url"] = source_image_url
+            enriched_article["image_origin"] = "source_metadata"
+            return enriched_article
+
+        fallback_input = dict(enriched_article)
+        fallback_input["image_url"] = ""
+        fallback_article = _attach_web_image_fallback(cfg, fallback_input)
+        fallback_image_url = _normalize_url(str(fallback_article.get("image_url", "")).strip())
+        if fallback_image_url:
+            enriched_article["image_url"] = fallback_image_url
+            if fallback_article.get("image_origin"):
+                enriched_article["image_origin"] = fallback_article.get("image_origin")
+            if fallback_article.get("image_source_page"):
+                enriched_article["image_source_page"] = fallback_article.get("image_source_page")
+            if fallback_article.get("image_search"):
+                enriched_article["image_search"] = fallback_article.get("image_search")
+            return enriched_article
+    except Exception as exc:
+        LOG.warning("editorial preview source enrichment failed url=%s err=%s", normalized_source, exc)
+
+    if existing_image_url:
+        enriched_article["image_url"] = existing_image_url
+    return enriched_article
+
+
 def _format_editorial_preview_message(article: dict[str, Any]) -> str:
     content_profile = str(article.get("content_profile", "")).strip().lower() or "news"
     profile_label = _profile_preview_label(content_profile)
@@ -2994,19 +3034,30 @@ def _handle_editorial_action(data: dict[str, Any]) -> tuple[dict[str, Any], int]
             validation_confidence = float(article.get("link_validation_confidence", 0.0) or 0.0)
             validation_reason = str(article.get("link_validation_reason", "")).strip()
 
+        enriched_preview_article = _resolve_preview_source_enrichment(cfg, article, source_url=source_url)
+        source_url = _normalize_url(str(enriched_preview_article.get("original_url", "")).strip()) or source_url
+        resolved_image_url = _normalize_url(str(enriched_preview_article.get("image_url", "")).strip())
+        resolved_source_published_at = str(enriched_preview_article.get("source_published_at", "")).strip()
+
+        persist_payload = {
+            "article_id": article_id,
+            "telegram_triage_status": "pending_approval",
+            "content_profile": requested_profile,
+            "original_url": source_url,
+            "source_link_origin": source_origin,
+            "link_validation_status": validation_status,
+            "link_validation_confidence": validation_confidence,
+            "link_validation_reason": validation_reason,
+        }
+        if resolved_image_url:
+            persist_payload["image_url"] = resolved_image_url
+        if resolved_source_published_at:
+            persist_payload["source_published_at"] = resolved_source_published_at
+
         _portal_api_post(
             cfg,
             "articles/link-validation/",
-            {
-                "article_id": article_id,
-                "telegram_triage_status": "pending_approval",
-                "content_profile": requested_profile,
-                "original_url": source_url,
-                "source_link_origin": source_origin,
-                "link_validation_status": validation_status,
-                "link_validation_confidence": validation_confidence,
-                "link_validation_reason": validation_reason,
-            },
+            persist_payload,
         )
         refreshed = _portal_api_get(cfg, "articles/editorial-data/", {"article_id": article_id})
         updated_article = refreshed.get("article") if isinstance(refreshed, dict) else article

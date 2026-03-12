@@ -493,8 +493,6 @@ def resource_submit(request: HttpRequest) -> HttpResponse:
     return render(request, "news/resource_submit.html", context)
 
 
-<<<<<<< HEAD
-=======
 @require_GET
 def product_list(request: HttpRequest) -> HttpResponse:
     """View for the Products section"""
@@ -533,6 +531,3 @@ def product_list(request: HttpRequest) -> HttpResponse:
         return render(request, "news/partials/article_cards.html", context)
     
     return render(request, "news/product_list.html", context)
-
-
->>>>>>> b4ad623 (feat: Implement Products feature with Telegram destination labeling and public card views)

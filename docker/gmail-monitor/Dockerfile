@@ -2,6 +2,8 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
+ARG OPENCLAW_NPM_PACKAGE=openclaw@2026.3.8
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     libpq-dev \
@@ -21,7 +23,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY portal/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
-RUN npm install -g openclaw@latest
+RUN npm install -g "${OPENCLAW_NPM_PACKAGE}"
 
 COPY portal/ /app/
 COPY scripts/ /app/scripts/

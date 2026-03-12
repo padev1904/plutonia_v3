@@ -15,13 +15,23 @@ fi
 mkdir -p "$workspace_dir"
 mkdir -p "$(dirname "$repo_dir")"
 
+depth_args=""
+case "$(printf '%s' "$repo_depth" | tr -d '[:space:]')" in
+  ""|0) depth_args="" ;;
+  *) depth_args="--depth $repo_depth" ;;
+esac
+
 if [ -d "$repo_dir/.git" ]; then
   case "$(printf '%s' "$repo_auto_update" | tr '[:upper:]' '[:lower:]')" in
     1|true|yes|on) ;;
     *) exit 0 ;;
   esac
   git -C "$repo_dir" remote set-url origin "$repo_url" || true
-  git -C "$repo_dir" fetch --depth "$repo_depth" origin "$repo_branch"
+  if [ -n "$depth_args" ]; then
+    git -C "$repo_dir" fetch $depth_args origin "$repo_branch"
+  else
+    git -C "$repo_dir" fetch --tags --prune origin "$repo_branch"
+  fi
   git -C "$repo_dir" checkout -B "$repo_branch" "origin/$repo_branch"
   git -C "$repo_dir" reset --hard "origin/$repo_branch"
   git -C "$repo_dir" clean -fd
@@ -34,4 +44,8 @@ if [ -e "$repo_dir" ] && [ -n "$(ls -A "$repo_dir" 2>/dev/null || true)" ]; then
 fi
 
 rm -rf "$repo_dir"
-git clone --depth "$repo_depth" --branch "$repo_branch" "$repo_url" "$repo_dir"
+if [ -n "$depth_args" ]; then
+  git clone $depth_args --branch "$repo_branch" "$repo_url" "$repo_dir"
+else
+  git clone --branch "$repo_branch" "$repo_url" "$repo_dir"
+fi

@@ -136,6 +136,8 @@ services:
         condition: service_healthy
       gmail-monitor:
         condition: service_healthy
+      ops-runner:
+        condition: service_started
     environment:
       SEARXNG_URL: http://searxng:8080
       OLLAMA_API_KEY: ollama-local
@@ -165,8 +167,18 @@ services:
       OPENCLAW_AGENT_WORKSPACE: /workspace
       OPENCLAW_BOOTSTRAP_REPO_URL: "${OPENCLAW_OPS_REPO_URL:-https://github.com/padev1904/plutonia_v3.git}"
       OPENCLAW_BOOTSTRAP_REPO_BRANCH: "${OPENCLAW_OPS_REPO_BRANCH:-main}"
+      OPENCLAW_BOOTSTRAP_REPO_DEPTH: "${OPENCLAW_OPS_REPO_DEPTH:-0}"
       OPENCLAW_BOOTSTRAP_REPO_DIR: /workspace/repo
       OPENCLAW_TOOLS_PROFILE: "${OPENCLAW_OPS_TOOLS_PROFILE:-coding}"
+      OPENCLAW_GIT_AUTHOR_NAME: "${OPENCLAW_OPS_GIT_AUTHOR_NAME:-OpenClaw Ops}"
+      OPENCLAW_GIT_AUTHOR_EMAIL: "${OPENCLAW_OPS_GIT_AUTHOR_EMAIL:-openclaw-ops@plutonia.local}"
+      OPENCLAW_GIT_PUSH_REMOTE: "${OPENCLAW_OPS_GIT_PUSH_REMOTE:-origin}"
+      OPENCLAW_GIT_PUSH_BRANCH: "${OPENCLAW_OPS_GIT_PUSH_BRANCH:-main}"
+      OPENCLAW_GIT_PUSH_URL: "${OPENCLAW_OPS_GIT_PUSH_URL:-}"
+      OPENCLAW_GITHUB_PUSH_TOKEN: "${OPENCLAW_OPS_GITHUB_PUSH_TOKEN:-}"
+      OPENCLAW_GITHUB_PUSH_USERNAME: "${OPENCLAW_OPS_GITHUB_PUSH_USERNAME:-x-access-token}"
+      OPS_RUNNER_BASE_URL: "http://ops-runner:8011"
+      OPS_RUNNER_TOKEN: "${OPS_RUNNER_TOKEN:-${OPS_API_TOKEN:-}}"
       OPENCLAW_WEB_FETCH_ENABLED: "${OPENCLAW_OPS_WEB_FETCH_ENABLED:-true}"
       OPENCLAW_WEB_SEARCH_ENABLED: "${OPENCLAW_OPS_WEB_SEARCH_ENABLED:-true}"
       OPENCLAW_WEB_SEARCH_PROVIDER: "${OPENCLAW_OPS_WEB_SEARCH_PROVIDER:-}"
@@ -186,6 +198,39 @@ services:
       timeout: 5s
       retries: 10
       start_period: 45s
+    networks:
+      - ainews-net
+
+  ops-runner:
+    container_name: plutonia-ops-runner
+    build:
+      context: .
+      dockerfile: docker/ops-runner/Dockerfile
+    restart: unless-stopped
+    environment:
+      OPS_RUNNER_TOKEN: "${OPS_RUNNER_TOKEN:-${OPS_API_TOKEN:-}}"
+      OPS_RUNNER_REPO_DIR: /srv/live-repo
+      OPS_RUNNER_COMPOSE_FILE: /srv/live-repo/docker-compose.yml
+      OPS_RUNNER_LOG_DIR: /logs
+      OPS_RUNNER_LIVE_BRANCH: "${OPS_RUNNER_LIVE_BRANCH:-main}"
+      OPS_RUNNER_REQUIRE_PUSHED_HEAD: "${OPS_RUNNER_REQUIRE_PUSHED_HEAD:-true}"
+      OPS_RUNNER_ALLOWED_SERVICES: "${OPS_RUNNER_ALLOWED_SERVICES:-portal,gmail-monitor,openclaw-ops,openclaw,ops-runner,nginx,litellm,searxng}"
+      OPS_RUNNER_DEPLOY_TIMEOUT_SECONDS: "${OPS_RUNNER_DEPLOY_TIMEOUT_SECONDS:-1800}"
+      OPS_RUNNER_GIT_TIMEOUT_SECONDS: "${OPS_RUNNER_GIT_TIMEOUT_SECONDS:-120}"
+    volumes:
+      - type: bind
+        source: .
+        target: /srv/live-repo
+      - portal-logs:/logs
+      - /var/run/docker.sock:/var/run/docker.sock
+    expose:
+      - "8011"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8011/healthz >/dev/null || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
     networks:
       - ainews-net
 

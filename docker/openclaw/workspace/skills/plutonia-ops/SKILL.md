@@ -25,7 +25,13 @@ Use this skill when the user asks you to inspect, monitor, or unblock the Pluton
 10. For production code changes, follow this order strictly:
    `edit -> validate -> promote_stack.py -> verify`.
    Use `repo_commit_push.py` plus `deploy_stack.py` separately only when you intentionally need the split flow.
-11. Keep responses concise and include what changed or what remains blocked.
+11. For mixed planning + implementation tasks, stay in the controller role and delegate sub-work when helpful:
+   - coder agent for repo edits
+   - reviewer agent for diff review and completeness checks
+   - editorial agent for writing tasks
+   - router agent for lightweight classification only
+   Use `python3 /workspace/bin/delegate_agent.py --agent <id> --task-file <path>`.
+12. Keep responses concise and include what changed or what remains blocked.
 
 ## Editorial shortcuts
 - `python3 /workspace/bin/editorial_action.py prepare_preview_process --article-id <id>`

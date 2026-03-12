@@ -20,6 +20,54 @@ function uniqueList(items) {
   return Array.from(new Set((items || []).map((item) => String(item).trim()).filter(Boolean)));
 }
 
+function intEnv(name, fallback) {
+  const raw = process.env[name];
+  const parsed = Number.parseInt(String(raw ?? fallback), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function buildModelSpec(prefix, defaults = {}) {
+  const fallbackId = defaults.id || "qwen3:14b-16k";
+  const fallbackName = defaults.name || fallbackId;
+  const fallbackContext = defaults.contextWindow || 16384;
+  const fallbackMaxTokens = defaults.maxTokens || fallbackContext;
+  const id = (process.env[`${prefix}_MODEL_ID`] || defaults.id || "").trim() || fallbackId;
+  const name = (process.env[`${prefix}_MODEL_NAME`] || defaults.name || "").trim() || fallbackName;
+  const contextWindow = intEnv(`${prefix}_MODEL_CONTEXT_WINDOW`, fallbackContext);
+  const maxTokens = intEnv(`${prefix}_MODEL_MAX_TOKENS`, fallbackMaxTokens);
+  return { id, name, contextWindow, maxTokens };
+}
+
+function mergeModelList(existingModels, modelSpecs) {
+  const merged = new Map();
+  for (const model of existingModels || []) {
+    if (model && model.id) {
+      merged.set(String(model.id), model);
+    }
+  }
+  for (const model of modelSpecs || []) {
+    if (model && model.id) {
+      merged.set(String(model.id), model);
+    }
+  }
+  return Array.from(merged.values());
+}
+
+function upsertAgent(existingAgents, agentSpec) {
+  const next = Array.isArray(existingAgents) ? [...existingAgents] : [];
+  const agentId = String(agentSpec.id || "").trim();
+  if (!agentId) {
+    return next;
+  }
+  const index = next.findIndex((entry) => String(entry?.id || "").trim() === agentId);
+  if (index >= 0) {
+    next[index] = { ...next[index], ...agentSpec };
+  } else {
+    next.push(agentSpec);
+  }
+  return next;
+}
+
 const configDir = process.env.OPENCLAW_CONFIG_DIR || "/root/.openclaw";
 const workspaceDir = process.env.OPENCLAW_AGENT_WORKSPACE || process.env.OPENCLAW_WORKSPACE_DIR || path.join(configDir, "workspace");
 const configPath = path.join(configDir, "openclaw.json");
@@ -38,6 +86,7 @@ const modelName = process.env.OPENCLAW_MODEL_NAME || modelId;
 const modelContextWindow = Number.parseInt(process.env.OPENCLAW_MODEL_CONTEXT_WINDOW || "16384", 10) || 16384;
 const modelMaxTokens = Number.parseInt(process.env.OPENCLAW_MODEL_MAX_TOKENS || String(modelContextWindow), 10) || modelContextWindow;
 const agentTimeoutSeconds = Number.parseInt(process.env.OPENCLAW_AGENT_TIMEOUT_SECONDS || "0", 10) || 0;
+const multiAgentEnabled = truthy(process.env.OPENCLAW_MULTI_AGENT_ENABLED, false);
 const gatewayToken = (process.env.OPENCLAW_GATEWAY_TOKEN || "").trim() || crypto.randomBytes(24).toString("hex");
 const gatewayRemoteUrl = (process.env.OPENCLAW_GATEWAY_REMOTE_URL || "ws://openclaw:18789").trim();
 const gatewayBind = (process.env.OPENCLAW_GATEWAY_BIND || "").trim();
@@ -62,10 +111,62 @@ const webFetchEnabled = truthy(process.env.OPENCLAW_WEB_FETCH_ENABLED, true);
 const webSearchEnabled = truthy(process.env.OPENCLAW_WEB_SEARCH_ENABLED, false);
 const searchProvider = (process.env.OPENCLAW_WEB_SEARCH_PROVIDER || "").trim();
 const searchApiKey = (process.env.OPENCLAW_WEB_SEARCH_API_KEY || process.env.BRAVE_API_KEY || "").trim();
-
 const config = fs.existsSync(configPath)
   ? JSON.parse(fs.readFileSync(configPath, "utf8"))
   : {};
+const controllerModel = buildModelSpec("OPENCLAW_CONTROLLER", {
+  id: modelId || "qwen3.5:27b",
+  name: modelName || modelId || "qwen3.5:27b",
+  contextWindow: modelContextWindow || 32768,
+  maxTokens: modelMaxTokens || modelContextWindow || 32768,
+});
+const coderModel = buildModelSpec("OPENCLAW_CODER", {
+  id: "qwen3-coder:latest",
+  name: "qwen3-coder:latest",
+  contextWindow: 32768,
+  maxTokens: 32768,
+});
+const reviewerModel = buildModelSpec("OPENCLAW_REVIEWER", {
+  id: controllerModel.id || "qwen3.5:27b",
+  name: controllerModel.name || controllerModel.id || "qwen3.5:27b",
+  contextWindow: 32768,
+  maxTokens: 32768,
+});
+const editorialModel = buildModelSpec("OPENCLAW_EDITORIAL", {
+  id: "qwen3:14b-16k",
+  name: "qwen3:14b-16k",
+  contextWindow: 16384,
+  maxTokens: 16384,
+});
+const routerModel = buildModelSpec("OPENCLAW_ROUTER", {
+  id: "qwen3.5:9b",
+  name: "qwen3.5:9b",
+  contextWindow: 8192,
+  maxTokens: 8192,
+});
+const defaultWorkspaceDir = multiAgentEnabled ? path.join(workspaceDir, "agents", "main") : workspaceDir;
+const defaultModel = multiAgentEnabled ? controllerModel : {
+  id: modelId,
+  name: modelName,
+  contextWindow: modelContextWindow,
+  maxTokens: modelMaxTokens,
+};
+const providerModels = multiAgentEnabled
+  ? mergeModelList((((config.models || {}).providers || {})[providerName] || {}).models || [], [
+      controllerModel,
+      coderModel,
+      reviewerModel,
+      editorialModel,
+      routerModel,
+    ])
+  : [
+      {
+        id: modelId,
+        name: modelName,
+        contextWindow: modelContextWindow,
+        maxTokens: modelMaxTokens,
+      },
+    ];
 const persistedGatewayToken = String(config.gateway?.auth?.token || config.gateway?.remote?.token || "").trim();
 const effectiveGatewayToken = gatewayToken || persistedGatewayToken || crypto.randomBytes(24).toString("hex");
 
@@ -93,14 +194,7 @@ config.models = {
       baseUrl: ollamaBaseUrl,
       apiKey: ollamaApiKey,
       api: "ollama",
-      models: [
-        {
-          id: modelId,
-          name: modelName,
-          contextWindow: modelContextWindow,
-          maxTokens: modelMaxTokens,
-        },
-      ],
+      models: providerModels,
     },
   },
 };
@@ -108,21 +202,80 @@ config.models = {
 config.agents = config.agents || {};
 config.agents.defaults = {
   ...(config.agents.defaults || {}),
-  model: `${providerName}/${modelId}`,
-  workspace: workspaceDir,
+  model: `${providerName}/${defaultModel.id}`,
+  workspace: defaultWorkspaceDir,
   skipBootstrap: true,
   ...(agentTimeoutSeconds > 0 ? { timeoutSeconds: agentTimeoutSeconds } : {}),
   models: {
     ...((config.agents.defaults || {}).models || {}),
-    [`${providerName}/${modelId}`]: {
-      alias: "openclaw_default",
+    [`${providerName}/${controllerModel.id}`]: {
+      alias: "openclaw_controller",
     },
+    ...(multiAgentEnabled
+      ? {
+          [`${providerName}/${coderModel.id}`]: {
+            alias: "openclaw_coder",
+          },
+          [`${providerName}/${reviewerModel.id}`]: {
+            alias: "openclaw_reviewer",
+          },
+          [`${providerName}/${editorialModel.id}`]: {
+            alias: "openclaw_editorial",
+          },
+          [`${providerName}/${routerModel.id}`]: {
+            alias: "openclaw_router",
+          },
+        }
+      : {
+          [`${providerName}/${modelId}`]: {
+            alias: "openclaw_default",
+          },
+        }),
   },
   compaction: {
     ...((config.agents.defaults || {}).compaction || {}),
     mode: "safeguard",
   },
 };
+if (multiAgentEnabled) {
+  let nextAgents = Array.isArray(config.agents.list) ? [...config.agents.list] : [];
+  nextAgents = upsertAgent(nextAgents, {
+    id: "main",
+    name: "main",
+    workspace: path.join(workspaceDir, "agents", "main"),
+    agentDir: path.join(configDir, "agents", "main", "agent"),
+    model: `${providerName}/${controllerModel.id}`,
+  });
+  nextAgents = upsertAgent(nextAgents, {
+    id: "coder",
+    name: "coder",
+    workspace: path.join(workspaceDir, "agents", "coder"),
+    agentDir: path.join(configDir, "agents", "coder", "agent"),
+    model: `${providerName}/${coderModel.id}`,
+  });
+  nextAgents = upsertAgent(nextAgents, {
+    id: "reviewer",
+    name: "reviewer",
+    workspace: path.join(workspaceDir, "agents", "reviewer"),
+    agentDir: path.join(configDir, "agents", "reviewer", "agent"),
+    model: `${providerName}/${reviewerModel.id}`,
+  });
+  nextAgents = upsertAgent(nextAgents, {
+    id: "editorial",
+    name: "editorial",
+    workspace: path.join(workspaceDir, "agents", "editorial"),
+    agentDir: path.join(configDir, "agents", "editorial", "agent"),
+    model: `${providerName}/${editorialModel.id}`,
+  });
+  nextAgents = upsertAgent(nextAgents, {
+    id: "router",
+    name: "router",
+    workspace: path.join(workspaceDir, "agents", "router"),
+    agentDir: path.join(configDir, "agents", "router", "agent"),
+    model: `${providerName}/${routerModel.id}`,
+  });
+  config.agents.list = nextAgents;
+}
 
 config.tools = config.tools || {};
 if (toolsProfile) {

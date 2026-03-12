@@ -31,6 +31,10 @@ Local authority inside the container:
   - `python3 /workspace/bin/repo_commit_push.py --message "<commit message>"`
   - `python3 /workspace/bin/deploy_stack.py --service <service> [--service <service> ...]`
   - `python3 /workspace/bin/rollback_stack.py --ref <git-ref> --service <service> [--service <service> ...]`
+  - `python3 /workspace/bin/delegate_agent.py --agent <coder|reviewer|editorial|router> --task "..." --text-only`
+    - creates a fresh delegated session
+    - keeps Telegram/SPOC on the main controller
+    - use for coding/review/editorial subtasks instead of reusing the controller session
 
 Use header `X-Ops-Token: $OPS_API_TOKEN` for ops endpoints when `OPS_API_TOKEN` is set.
 Use header `X-Ops-Runner-Token: $OPS_RUNNER_TOKEN` for ops-runner endpoints when `OPS_RUNNER_TOKEN` is set.

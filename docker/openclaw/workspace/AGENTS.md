@@ -19,6 +19,12 @@ Operating rules:
 - For code or config changes, work in `./repo`, run the relevant checks, then commit and push to GitHub before any deploy.
 - Never deploy uncommitted or unpushed workspace changes.
 - Use `python3 /workspace/bin/repo_status.py --text-only` to compare workspace state with the live repo.
+- You are the controller/orchestrator. For substantial coding work, delegate implementation to specialist agents:
+  - `python3 /workspace/bin/delegate_agent.py --agent coder --task-file <path>`
+  - `python3 /workspace/bin/delegate_agent.py --agent reviewer --task-file <path>`
+  - `python3 /workspace/bin/delegate_agent.py --agent editorial --task-file <path>`
+- Keep final responsibility for scope, validation, promotion, and user-facing replies. Delegation does not transfer accountability.
+- Before promoting non-trivial code changes, request a reviewer pass on the exact diff.
 - For multi-file changes, map the requested behavior to the exact files first. Do not edit broadly before you know which files own the requirement.
 - Work in one vertical slice at a time. Do not leave placeholder routes, buttons, templates, or content types without the backend behavior needed for that same slice.
 - After each substantive edit batch, inspect the exact diff for the touched files and run targeted validation before editing more files.

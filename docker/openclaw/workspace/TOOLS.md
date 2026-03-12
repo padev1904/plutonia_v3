@@ -19,6 +19,9 @@ Local authority inside the container:
 - Writable shared logs: `/logs`
 - Available CLI tools: `bash`, `git`, `ssh`, `curl`, `jq`, `rg`, `python3`, `pip`, `psql`, `nc`, `ping`, `rsync`
 - Editorial helper scripts:
+  - `python3 /workspace/bin/ops_status.py`
+  - `python3 /workspace/bin/ops_status.py --text-only`
+  - `python3 /workspace/bin/ops_action.py <action> [--reason "..."] [--text-only]`
   - `python3 /workspace/bin/editorial_session.py`
   - `python3 /workspace/bin/editorial_session.py --text`
   - `python3 /workspace/bin/editorial_action.py <action> ...`
@@ -36,6 +39,7 @@ Local authority inside the container:
     - keeps Telegram/SPOC on the main controller
     - use for coding/review/editorial subtasks instead of reusing the controller session
 
+Prefer the helper scripts for ops/editorial APIs. Use raw headers only as a fallback.
 Use header `X-Ops-Token: $OPS_API_TOKEN` for ops endpoints when `OPS_API_TOKEN` is set.
 Use header `X-Ops-Runner-Token: $OPS_RUNNER_TOKEN` for ops-runner endpoints when `OPS_RUNNER_TOKEN` is set.
 
@@ -58,3 +62,10 @@ Mandatory promotion flow for production changes:
 9. Deploy with `deploy_stack.py`.
 10. Confirm live status with `repo_status.py` and health endpoints.
 11. If health degrades, roll back with `rollback_stack.py`.
+
+Correction flow for unpublished local work:
+1. Run `git status -sb`.
+2. If the branch is `ahead`, inspect the unpublished work with `git show --stat -1` and `git diff --name-only origin/main..HEAD`.
+3. Remove any out-of-scope files from `origin/main..HEAD` before pushing.
+4. Re-run validation after the correction.
+5. Only then push and promote.

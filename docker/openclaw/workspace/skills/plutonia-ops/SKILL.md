@@ -10,13 +10,13 @@ Use this skill when the user asks you to inspect, monitor, or unblock the Pluton
 - Editorial action endpoint: `http://ainews-gmail-monitor:8001/api/editorial/action`
 
 ## Default workflow
-1. Fetch the current runtime snapshot from the ops status endpoint.
+1. Fetch the current runtime snapshot with `python3 /workspace/bin/ops_status.py`.
 2. Fetch the editorial session with `python3 /workspace/bin/editorial_session.py` before replying in Telegram.
 3. If an editorial session is active, keep the user in that flow and trigger backend actions with `python3 /workspace/bin/editorial_action.py`.
    Irreversible actions are gated: `approve_preview` and `reject_article` require `--user-request "<latest user message exactly>"`.
    Do not treat "next/continue/resume/retoma/envia a próxima" as approval or rejection.
    If the user asks for the public portal/article link, use `python3 /workspace/bin/portal_public_link.py --text-only`.
-4. If runtime action is needed, prefer the ops action endpoint over ad-hoc process intervention.
+4. If runtime action is needed, prefer `python3 /workspace/bin/ops_action.py ...` over raw HTTP or ad-hoc process intervention.
 5. Use shell, git, Python, ripgrep, HTTP fetch, and Docker-internal services freely inside the container when they help.
 6. Only edit code under `./repo` when the user is asking for a code or config change.
 7. For multi-file changes, map the requested behavior to the exact files first. Then complete one vertical slice at a time instead of scattering placeholder changes across the repo.
@@ -25,13 +25,15 @@ Use this skill when the user asks you to inspect, monitor, or unblock the Pluton
 10. For production code changes, follow this order strictly:
    `edit -> validate -> promote_stack.py -> verify`.
    Use `repo_commit_push.py` plus `deploy_stack.py` separately only when you intentionally need the split flow.
-11. For mixed planning + implementation tasks, stay in the controller role and delegate sub-work when helpful:
+11. If the repo is clean but `git status -sb` shows `ahead`, treat the unpublished local commit as the current work item. Inspect it with `git show --stat -1` and `git diff --name-only origin/main..HEAD` before deciding what to do next.
+12. When the user gives corrective feedback on unpublished work, fix the existing local change set first. Remove out-of-scope files from `origin/main..HEAD` before any push or deploy.
+13. For mixed planning + implementation tasks, stay in the controller role and delegate sub-work when helpful:
    - coder agent for repo edits
    - reviewer agent for diff review and completeness checks
    - editorial agent for writing tasks
    - router agent for lightweight classification only
    Use `python3 /workspace/bin/delegate_agent.py --agent <id> --task-file <path>`.
-12. Keep responses concise and include what changed or what remains blocked.
+14. Keep responses concise and include what changed or what remains blocked.
 
 ## Editorial shortcuts
 - `python3 /workspace/bin/editorial_action.py prepare_preview_process --article-id <id>`
@@ -40,6 +42,8 @@ Use this skill when the user asks you to inspect, monitor, or unblock the Pluton
 - `python3 /workspace/bin/editorial_action.py approve_preview --article-id <id> --user-request "aprova a publicação" --text-only`
 - `python3 /workspace/bin/editorial_action.py reject_article --article-id <id> --user-request "rejeita este artigo" --text-only`
 - `python3 /workspace/bin/portal_public_link.py --text-only`
+- `python3 /workspace/bin/ops_status.py --text-only`
+- `python3 /workspace/bin/ops_action.py restart_monitor --reason "..." --text-only`
 - `python3 /workspace/bin/repo_status.py --text-only`
 - `python3 /workspace/bin/promote_stack.py --message "..." --service portal --health-url http://portal:8000/healthz --text-only`
   - waits for health and auto-rolls back to the previous live ref if final health verification fails

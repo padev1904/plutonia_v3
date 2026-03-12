@@ -27,6 +27,10 @@ if [ -d "$repo_dir/.git" ]; then
     1|true|yes|on) ;;
     *) exit 0 ;;
   esac
+  if [ -n "$(git -C "$repo_dir" status --porcelain 2>/dev/null || true)" ]; then
+    echo "openclaw workspace repo is dirty; skipping auto-update: $repo_dir" >&2
+    exit 0
+  fi
   git -C "$repo_dir" remote set-url origin "$repo_url" || true
   if [ -n "$depth_args" ]; then
     git -C "$repo_dir" fetch $depth_args origin "$repo_branch"

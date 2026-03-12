@@ -69,7 +69,17 @@ def _run(
     return result
 
 
+def _ensure_safe_directory() -> None:
+    subprocess.run(
+        ["git", "config", "--global", "--add", "safe.directory", str(REPO_DIR)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
 def _git(*args: str, timeout: int = GIT_TIMEOUT_SECONDS, check: bool = True) -> subprocess.CompletedProcess[str]:
+    _ensure_safe_directory()
     return _run(["git", *args], cwd=REPO_DIR, timeout=timeout, check=check)
 
 

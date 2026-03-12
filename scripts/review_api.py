@@ -3152,6 +3152,10 @@ class ReviewAPIHandler(BaseHTTPRequestHandler):
         _send_json(self, result, status)
 
 
+class ReusableHTTPServer(HTTPServer):
+    allow_reuse_address = True
+
+
 def start_review_api_server(port: int = 0) -> threading.Thread:
     """Start the review API server as a background daemon thread.
 
@@ -3166,7 +3170,7 @@ def start_review_api_server(port: int = 0) -> threading.Thread:
         The running daemon thread (already started).
     """
     listen_port = port or REVIEW_API_PORT
-    server = HTTPServer(("0.0.0.0", listen_port), ReviewAPIHandler)
+    server = ReusableHTTPServer(("0.0.0.0", listen_port), ReviewAPIHandler)
     thread = threading.Thread(
         target=server.serve_forever,
         name="review-api-server",

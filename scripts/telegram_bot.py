@@ -1596,9 +1596,6 @@ async def _send_next_for_triage(bot, cfg: Config):
         if TELEGRAM_TRIAGE_NEWSLETTER_ID:
             params["newsletter_id"] = TELEGRAM_TRIAGE_NEWSLETTER_ID
         result = _api_get(cfg, "articles/editorial-pending/", params)
-        if result.get("status") != "ok":
-            return
-
         article = result.get("article")
         if not article:
             return

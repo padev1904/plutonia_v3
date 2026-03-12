@@ -37,6 +37,12 @@ if [ -d "$repo_dir/.git" ]; then
   else
     git -C "$repo_dir" fetch --tags --prune origin "$repo_branch"
   fi
+  ahead_behind="$(git -C "$repo_dir" rev-list --left-right --count "HEAD...origin/$repo_branch" 2>/dev/null || printf '0\t0')"
+  ahead_count="$(printf '%s' "$ahead_behind" | awk '{print $1}')"
+  if [ "${ahead_count:-0}" -gt 0 ] 2>/dev/null; then
+    echo "openclaw workspace repo is ahead of origin; skipping auto-update: $repo_dir" >&2
+    exit 0
+  fi
   git -C "$repo_dir" checkout -B "$repo_branch" "origin/$repo_branch"
   git -C "$repo_dir" reset --hard "origin/$repo_branch"
   git -C "$repo_dir" clean -fd

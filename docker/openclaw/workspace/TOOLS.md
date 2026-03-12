@@ -6,6 +6,10 @@
 - Editorial action: `POST http://ainews-gmail-monitor:8001/api/editorial/action`
 - Review API health: `GET http://ainews-gmail-monitor:8001/healthz`
 - Portal health: `GET http://portal:8000/healthz`
+- Ops runner health: `GET http://ops-runner:8011/healthz`
+- Ops runner status: `GET http://ops-runner:8011/status`
+- Ops runner deploy: `POST http://ops-runner:8011/deploy`
+- Ops runner rollback: `POST http://ops-runner:8011/rollback`
 - SearXNG: `http://searxng:8080`
 - Ollama: `http://ollama:11434`
 
@@ -21,8 +25,14 @@ Local authority inside the container:
     - `approve_preview` and `reject_article` require `--user-request "<latest user message exactly>"`
     - generic "next/continue/resume" requests must not be treated as approval/rejection
   - `python3 /workspace/bin/portal_public_link.py --text-only`
+  - `python3 /workspace/bin/repo_status.py --text-only`
+  - `python3 /workspace/bin/promote_stack.py --message "..." --service portal --health-url http://portal:8000/healthz`
+  - `python3 /workspace/bin/repo_commit_push.py --message "<commit message>"`
+  - `python3 /workspace/bin/deploy_stack.py --service <service> [--service <service> ...]`
+  - `python3 /workspace/bin/rollback_stack.py --ref <git-ref> --service <service> [--service <service> ...]`
 
 Use header `X-Ops-Token: $OPS_API_TOKEN` for ops endpoints when `OPS_API_TOKEN` is set.
+Use header `X-Ops-Runner-Token: $OPS_RUNNER_TOKEN` for ops-runner endpoints when `OPS_RUNNER_TOKEN` is set.
 
 Safe runtime actions currently available:
 - `restart_monitor`
@@ -30,3 +40,12 @@ Safe runtime actions currently available:
 - `notify_next_resource_review`
 - `sync_gmail_labels`
 - `recover_review_gate`
+
+Mandatory promotion flow for production changes:
+1. Edit code under `/workspace/repo`.
+2. Run the relevant validation commands locally in the workspace.
+3. Prefer `promote_stack.py` for commit/push/deploy in one step.
+4. If you split the flow manually, commit and push with `repo_commit_push.py`.
+5. Deploy with `deploy_stack.py`.
+6. Confirm live status with `repo_status.py` and health endpoints.
+7. If health degrades, roll back with `rollback_stack.py`.

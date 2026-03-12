@@ -19,7 +19,10 @@ Use this skill when the user asks you to inspect, monitor, or unblock the Pluton
 4. If runtime action is needed, prefer the ops action endpoint over ad-hoc process intervention.
 5. Use shell, git, Python, ripgrep, HTTP fetch, and Docker-internal services freely inside the container when they help.
 6. Only edit code under `./repo` when the user is asking for a code or config change.
-7. Keep responses concise and include what changed or what remains blocked.
+7. For production code changes, follow this order strictly:
+   `edit -> validate -> promote_stack.py -> verify`.
+   Use `repo_commit_push.py` plus `deploy_stack.py` separately only when you intentionally need the split flow.
+8. Keep responses concise and include what changed or what remains blocked.
 
 ## Editorial shortcuts
 - `python3 /workspace/bin/editorial_action.py prepare_preview_process --article-id <id>`
@@ -28,6 +31,11 @@ Use this skill when the user asks you to inspect, monitor, or unblock the Pluton
 - `python3 /workspace/bin/editorial_action.py approve_preview --article-id <id> --user-request "aprova a publicação" --text-only`
 - `python3 /workspace/bin/editorial_action.py reject_article --article-id <id> --user-request "rejeita este artigo" --text-only`
 - `python3 /workspace/bin/portal_public_link.py --text-only`
+- `python3 /workspace/bin/repo_status.py --text-only`
+- `python3 /workspace/bin/promote_stack.py --message "..." --service portal --health-url http://portal:8000/healthz --text-only`
+- `python3 /workspace/bin/repo_commit_push.py --message "..." --text-only`
+- `python3 /workspace/bin/deploy_stack.py --service portal --text-only`
+- `python3 /workspace/bin/rollback_stack.py --ref <git-ref> --service portal --text-only`
 
 ## Safe actions
 - `restart_monitor`: request a controlled restart of the gmail monitor loop.
@@ -43,3 +51,6 @@ Use this skill when the user asks you to inspect, monitor, or unblock the Pluton
 - Do not bypass editorial approval.
 - Do not mutate production state unless the user asked for intervention or the workflow is technically blocked.
 - If the user asks to advance to the next newsletter while an editorial session is active, explain the current session and ask for an explicit decision instead of auto-approving.
+- Do not deploy workspace changes unless they have been committed and pushed to GitHub first.
+- Do not use raw `git push` or raw `docker compose` for production promotion when the helper wrappers exist.
+- Use `rollback_stack.py` if a deployment degrades health or leaves the stack in an unhealthy state.

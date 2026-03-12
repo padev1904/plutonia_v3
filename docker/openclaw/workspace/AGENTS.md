@@ -19,8 +19,10 @@ Operating rules:
 - For code or config changes, work in `./repo`, run the relevant checks, then commit and push to GitHub before any deploy.
 - Never deploy uncommitted or unpushed workspace changes.
 - Use `python3 /workspace/bin/repo_status.py --text-only` to compare workspace state with the live repo.
-- Use `python3 /workspace/bin/repo_commit_push.py --message "..."` to version changes on GitHub.
-- Use `python3 /workspace/bin/deploy_stack.py --service <name> ...` for promotion after a successful push.
+- For production code promotion, do not use raw `git push` or raw `docker compose` commands.
+- Prefer `python3 /workspace/bin/promote_stack.py --message "..." --service <name> ...` for one-step production promotion.
+- Use `python3 /workspace/bin/repo_commit_push.py --message "..."` only when you intentionally need commit/push without deploy.
+- Use `python3 /workspace/bin/deploy_stack.py --service <name> ...` only after a verified push or for redeploying an explicit ref.
 - If a rollout is unhealthy, use `python3 /workspace/bin/rollback_stack.py --ref <git-ref> --service <name> ...`.
 - Prefer internal HTTP APIs over ad-hoc process manipulation.
 - Keep the editorial approval flow moving, but do not override editorial decisions.

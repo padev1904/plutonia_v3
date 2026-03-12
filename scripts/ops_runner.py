@@ -39,6 +39,8 @@ ALLOWED_SERVICES = {
 }
 DEPLOY_TIMEOUT_SECONDS = int(os.getenv("OPS_RUNNER_DEPLOY_TIMEOUT_SECONDS", "1800"))
 GIT_TIMEOUT_SECONDS = int(os.getenv("OPS_RUNNER_GIT_TIMEOUT_SECONDS", "120"))
+HEALTH_WAIT_SECONDS = int(os.getenv("OPS_RUNNER_HEALTH_WAIT_SECONDS", "180"))
+HEALTH_POLL_SECONDS = max(1, int(os.getenv("OPS_RUNNER_HEALTH_POLL_SECONDS", "5")))
 
 
 class ConflictError(RuntimeError):
@@ -131,8 +133,11 @@ def _repo_status() -> dict[str, Any]:
     }
 
 
-def _compose_ps() -> list[dict[str, Any]]:
-    result = _compose("ps", "--format", "json", timeout=120, check=False)
+def _compose_ps(services: list[str] | None = None) -> list[dict[str, Any]]:
+    cmd = ["ps", "--format", "json"]
+    if services:
+        cmd.extend(services)
+    result = _compose(*cmd, timeout=120, check=False)
     payload = (result.stdout or "").strip()
     if not payload:
         return []
@@ -145,6 +150,44 @@ def _compose_ps() -> list[dict[str, Any]]:
     except Exception:
         pass
     return [{"raw": payload}]
+
+
+def _wait_for_services(services: list[str], timeout: int = HEALTH_WAIT_SECONDS) -> list[dict[str, Any]]:
+    deadline = time.time() + max(1, timeout)
+    last_snapshot: list[dict[str, Any]] = []
+    while time.time() < deadline:
+        snapshot = _compose_ps(services)
+        last_snapshot = snapshot
+        by_service = {
+            str(item.get("Service") or item.get("Name") or "").strip(): item
+            for item in snapshot
+            if isinstance(item, dict)
+        }
+        pending: list[str] = []
+        for service in services:
+            row = by_service.get(service)
+            if not row:
+                pending.append(f"{service}=missing")
+                continue
+            health = str(row.get("Health") or "").strip().lower()
+            state = str(row.get("State") or "").strip().lower()
+            status = str(row.get("Status") or "").strip().lower()
+            if health:
+                ok = health == "healthy"
+                label = f"health={health}"
+            elif "unhealthy" in status:
+                ok = False
+                label = status
+            else:
+                ok = state == "running"
+                label = f"state={state or 'unknown'}"
+            if not ok:
+                pending.append(f"{service}={label}")
+        if not pending:
+            return snapshot
+        time.sleep(HEALTH_POLL_SECONDS)
+    details = ", ".join(pending) if pending else "unknown"
+    raise RuntimeError(f"services did not become healthy before timeout: {details}")
 
 
 def _record_event(action: str, payload: dict[str, Any], result: dict[str, Any]) -> None:
@@ -249,6 +292,7 @@ def _handle_deploy(
         compose_args.append("--build")
     compose_args.extend(services)
     _compose(*compose_args, timeout=DEPLOY_TIMEOUT_SECONDS)
+    compose_snapshot = _wait_for_services(services)
     after = _repo_status()
     result = {
         "status": "ok",
@@ -258,7 +302,7 @@ def _handle_deploy(
         "build": build,
         "before": before,
         "after": after,
-        "compose": {"services": _compose_ps()},
+        "compose": {"services": compose_snapshot},
     }
     _record_event(action, {"services": services, "ref": ref, "build": build, "reason": reason}, result)
     return result, 200

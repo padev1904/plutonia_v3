@@ -5,6 +5,7 @@ import argparse
 import json
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -56,6 +57,19 @@ def _healthcheck(url: str) -> dict:
         return {"url": url, "status": "error", "error": str(exc)}
 
 
+def _wait_for_health(urls: list[str], timeout: int, interval: int) -> list[dict]:
+    if not urls:
+        return []
+    deadline = time.time() + max(1, timeout)
+    last_results: list[dict] = []
+    while time.time() <= deadline:
+        last_results = [_healthcheck(url) for url in urls]
+        if all(item.get("status") == "ok" for item in last_results):
+            return last_results
+        time.sleep(max(1, interval))
+    return last_results
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Commit, push, deploy, and verify a production change")
     parser.add_argument("--message", required=True, help="Commit message")
@@ -65,11 +79,17 @@ def main() -> int:
     parser.add_argument("--health-url", action="append", default=[], help="Optional health URL to verify after deploy")
     parser.add_argument("--allow-empty", action="store_true")
     parser.add_argument("--no-build", action="store_true")
+    parser.add_argument("--health-timeout", type=int, default=180)
+    parser.add_argument("--health-interval", type=int, default=5)
     parser.add_argument("--text-only", action="store_true")
     args = parser.parse_args()
 
     try:
         services = _collect_services(args.service)
+        baseline_status = _run_json("repo_status.py")
+        runner = baseline_status.get("runner") if isinstance(baseline_status, dict) else {}
+        runner_repo = runner.get("repo") if isinstance(runner, dict) else {}
+        rollback_ref = str(runner_repo.get("head") or "").strip()
         commit_cmd = ["--message", args.message.strip()]
         for path in args.path:
             commit_cmd.extend(["--path", path])
@@ -87,18 +107,36 @@ def main() -> int:
             deploy_cmd.extend(["--service", service])
         deploy_result = _run_json("deploy_stack.py", *deploy_cmd)
 
-        health_results = [_healthcheck(url.strip()) for url in args.health_url if url.strip()]
+        health_results = _wait_for_health(
+            [url.strip() for url in args.health_url if url.strip()],
+            timeout=args.health_timeout,
+            interval=args.health_interval,
+        )
         health_ok = all(item.get("status") == "ok" for item in health_results) if health_results else True
+        rollback_result = None
+        if not health_ok and rollback_ref:
+            rollback_cmd = ["--ref", rollback_ref, "--reason", "automatic rollback after failed health check"]
+            if args.no_build:
+                rollback_cmd.append("--no-build")
+            for service in services:
+                rollback_cmd.extend(["--service", service])
+            rollback_result = _run_json("rollback_stack.py", *rollback_cmd)
 
         payload = {
             "status": "ok" if health_ok else "degraded",
             "commit": commit_result,
             "deploy": deploy_result,
             "health": health_results,
+            "rollback": rollback_result,
         }
         if args.text_only:
-            health_state = "ok" if health_ok else "degraded"
-            print(f"Promoted {commit_head} to {', '.join(services)}; health={health_state}")
+            if health_ok:
+                print(f"Promoted {commit_head} to {', '.join(services)}; health=ok")
+            else:
+                print(
+                    f"Promoted {commit_head} to {', '.join(services)}; health=degraded; "
+                    f"rollback={'ok' if rollback_result else 'not-run'}"
+                )
         else:
             print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0 if health_ok else 1

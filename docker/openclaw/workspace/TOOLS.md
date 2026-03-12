@@ -27,6 +27,7 @@ Local authority inside the container:
   - `python3 /workspace/bin/portal_public_link.py --text-only`
   - `python3 /workspace/bin/repo_status.py --text-only`
   - `python3 /workspace/bin/promote_stack.py --message "..." --service portal --health-url http://portal:8000/healthz`
+    - waits for health and auto-rolls back to the previous live ref if final health verification fails
   - `python3 /workspace/bin/repo_commit_push.py --message "<commit message>"`
   - `python3 /workspace/bin/deploy_stack.py --service <service> [--service <service> ...]`
   - `python3 /workspace/bin/rollback_stack.py --ref <git-ref> --service <service> [--service <service> ...]`

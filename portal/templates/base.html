@@ -18,6 +18,7 @@
           <a href="/" class="site-brand flex items-center gap-2 text-2xl font-extrabold tracking-tight text-slate-900">Plutonia AI Newsroom</a>
           <nav class="flex flex-wrap items-center gap-2 text-sm font-medium">
             <a class="nav-pill {% if request.path == '/' or request.path|slice:':9' == '/article/' %}is-active{% endif %}" href="/">News</a>
+            <a class="nav-pill {% if request.path|slice:':9' == '/products/' %}is-active{% endif %}" href="/products/">Products</a>
             <a class="nav-pill {% if request.path|slice:':11' == '/resources/' %}is-active{% endif %}" href="/resources/">Resources</a>
             <a class="nav-ghost" href="/admin/">Admin</a>
           </nav>

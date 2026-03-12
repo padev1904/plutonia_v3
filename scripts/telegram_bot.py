@@ -676,7 +676,7 @@ def _format_triage_preview(
     lines.extend([
         f"Titulo original: <b>{title}</b>",
         f"Titulo (modelo): <b>{_esc(proposed)}</b>",
-        f"Tipo de conteudo atual: <b>{'Resource' if current_profile == 'resource' else 'News'}</b>",
+        f"Tipo de conteudo atual: <b>{'Product' if current_profile == 'product' else 'Resource' if current_profile == 'resource' else 'News'}</b>",
         f"Source Link atual: <b>{'Manual' if current_source == 'manual' else 'Processo'}</b>",
     ])
 
@@ -729,7 +729,7 @@ def _format_structured_preview(
     else:  # news
         publication_destination = "News"
         
-    profile_label = "RECURSO" if content_profile == "resource" else "NOTICIA"
+    profile_label = "RECURSO" if content_profile == "resource" else "PRODUTO" if content_profile == "product" else "NOTICIA"
     section = _esc(str(article.get("section", "")))
     category = _esc(str(article.get("category", "")))
     subcategory = _esc(str(article.get("subcategory", "")))
@@ -771,6 +771,7 @@ def _triage_buttons(article_id: int, selection_state: dict[str, Any] | None = No
         [
             InlineKeyboardButton("Tipo: News", callback_data=f"m1type_news_{article_id}"),
             InlineKeyboardButton("Tipo: Resource", callback_data=f"m1type_resource_{article_id}"),
+            InlineKeyboardButton("Tipo: Product", callback_data=f"m1type_product_{article_id}"),
         ],
         [
             InlineKeyboardButton("Source: Processo", callback_data=f"m1source_process_{article_id}"),

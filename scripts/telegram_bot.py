@@ -1332,6 +1332,10 @@ async def _handle_m1type_resource(query, article_id: int, bot=None):
     await _handle_select_type(query, article_id, "resource")
 
 
+async def _handle_m1type_product(query, article_id: int, bot=None):
+    await _handle_select_type(query, article_id, "product")
+
+
 async def _handle_m1source_process(query, article_id: int, bot=None):
     await _handle_select_source(query, article_id, "process")
 
@@ -1363,6 +1367,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     handlers = {
         "m1type_news_": _handle_m1type_news,
         "m1type_resource_": _handle_m1type_resource,
+        "m1type_product_": _handle_m1type_product,
         "m1source_process_": _handle_m1source_process,
         "m1source_manual_": _handle_m1source_manual,
         "m1confirm_": _handle_m1confirm,

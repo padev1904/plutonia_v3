@@ -2617,7 +2617,7 @@ def _format_editorial_triage_message(article: dict[str, Any], newsletter_meta: d
         [
             f"Titulo original: {title}",
             f"Titulo (modelo): {proposed}",
-            f"Tipo atual: {'Resource' if current_profile == 'resource' else 'News'}",
+            f"Tipo atual: {_profile_display_name(current_profile)}",
             f"Source atual: {'Manual' if source_label == 'manual' else 'Processo'}",
             f"Link atual: {source_url}",
             f"Validacao link: {_editorial_status_label(str(article.get('link_validation_status', '')))}",
@@ -2637,8 +2637,37 @@ def _format_editorial_triage_message(article: dict[str, Any], newsletter_meta: d
     return "\n".join(lines)
 
 
+def _profile_display_name(profile: str) -> str:
+    normalized = str(profile).strip().lower()
+    if normalized == "resource":
+        return "Resource"
+    if normalized == "product":
+        return "Product"
+    return "News"
+
+
+def _profile_preview_label(profile: str) -> str:
+    normalized = str(profile).strip().lower()
+    if normalized == "resource":
+        return "RECURSO"
+    if normalized == "product":
+        return "PRODUTO"
+    return "NOTICIA"
+
+
+def _publication_destination_label(profile: str) -> str:
+    normalized = str(profile).strip().lower()
+    if normalized == "resource":
+        return "Resources"
+    if normalized == "product":
+        return "Products"
+    return "News"
+
+
 def _format_editorial_preview_message(article: dict[str, Any]) -> str:
-    profile_label = "RECURSO" if str(article.get("content_profile", "")).strip().lower() == "resource" else "NOTICIA"
+    content_profile = str(article.get("content_profile", "")).strip().lower() or "news"
+    profile_label = _profile_preview_label(content_profile)
+    publication_destination = _publication_destination_label(content_profile)
     taxonomy = " > ".join(
         [
             item
@@ -2656,6 +2685,7 @@ def _format_editorial_preview_message(article: dict[str, Any]) -> str:
         f"Preview privado [{profile_label}]",
         str(article.get("title", "")).strip() or "Sem titulo",
         taxonomy,
+        f"Destino de publicacao: {publication_destination}",
     ]
     if card_url:
         lines.append(f"Card: {card_url}")
@@ -2876,11 +2906,13 @@ def _publish_resource_from_editorial_article(cfg: Config, article: dict[str, Any
 
 def _format_publication_confirmation(article: dict[str, Any], resource: dict[str, Any] | None = None) -> str:
     title = str(article.get("title", "")).strip() or "Sem titulo"
+    content_profile = str(article.get("content_profile", "news")).strip().lower() or "news"
     lines = [
         "Publicacao aprovada",
         f"Titulo: {title}",
+        f"Destino de publicacao: {_publication_destination_label(content_profile)}",
     ]
-    if str(article.get("content_profile", "news")).strip().lower() == "resource" and isinstance(resource, dict):
+    if content_profile == "resource" and isinstance(resource, dict):
         resource_id = resource.get("id")
         public_url = _build_external_public_url(f"/resources/item/{int(resource_id)}/") if resource_id else ""
         lines.append(f"Recurso: {public_url or 'link publico indisponivel'}")
@@ -2919,8 +2951,8 @@ def _handle_editorial_action(data: dict[str, Any]) -> tuple[dict[str, Any], int]
 
     if action in {"prepare_preview", "prepare_preview_process", "prepare_preview_manual", "provide_source"}:
         requested_profile = str(data.get("content_profile", "")).strip().lower() or str(article.get("content_profile", "")).strip().lower() or "news"
-        if requested_profile not in {"news", "resource"}:
-            return {"error": "content_profile must be news|resource"}, 400
+        if requested_profile not in {"news", "resource", "product"}:
+            return {"error": "content_profile must be news|resource|product"}, 400
 
         source_mode = str(data.get("source_mode", "")).strip().lower()
         if action == "prepare_preview_process":

@@ -8,7 +8,6 @@ import json
 import logging
 import os
 import re
-import time
 from pathlib import Path
 from typing import Any
 
@@ -23,10 +22,14 @@ EDITORIAL_TELEGRAM_NOTIFY = os.getenv("EDITORIAL_TELEGRAM_NOTIFY", "true").strip
     "yes",
     "on",
 }
+OPENCLAW_SINGLE_SPOC = os.getenv("OPENCLAW_SINGLE_SPOC", "false").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 PORTAL_PUBLIC_BASE_URL = os.getenv("PORTAL_PUBLIC_BASE_URL", "").strip().rstrip("/")
-CLOUDFLARED_CONTAINER_NAME = os.getenv("CLOUDFLARED_CONTAINER_NAME", "ainews-cloudflared").strip()
 _PUBLIC_BASE_CACHE: str | None = None
-_TRYCLOUDFLARE_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com", re.IGNORECASE)
 _PREVIEW_TOKEN_RE = re.compile(r"/preview/([0-9a-fA-F-]{36})/?")
 
 
@@ -188,28 +191,11 @@ def _resolve_public_base_url() -> str:
     if PORTAL_PUBLIC_BASE_URL:
         _PUBLIC_BASE_CACHE = PORTAL_PUBLIC_BASE_URL
         return _PUBLIC_BASE_CACHE
-
-    for attempt in range(1, 6):
-        try:
-            import docker  # Lazy import
-
-            client = docker.from_env()
-            container = client.containers.get(CLOUDFLARED_CONTAINER_NAME)
-            logs = container.logs(tail=500).decode("utf-8", errors="replace")
-            matches = _TRYCLOUDFLARE_RE.findall(logs)
-            if matches:
-                _PUBLIC_BASE_CACHE = matches[-1].rstrip("/")
-                return _PUBLIC_BASE_CACHE
-        except Exception as exc:
-            LOG.warning("failed to resolve public base url from cloudflared logs: %s", exc)
-            break
-        if attempt < 5:
-            time.sleep(1)
     return ""
 
 
 def _send_editorial_review_notifications(cfg: Config, newsletter_id: int, result: dict) -> None:
-    if not EDITORIAL_TELEGRAM_NOTIFY:
+    if not EDITORIAL_TELEGRAM_NOTIFY or OPENCLAW_SINGLE_SPOC:
         return
 
     token, chat_id = _resolve_telegram_config(cfg)

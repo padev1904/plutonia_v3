@@ -1,6 +1,6 @@
 services:
   gmail-monitor:
-    command: ["python", "-Xfrozen_modules=off", "/opt/ai-news-scripts/gmail_monitor.py", "--mode", "monitor"]
+    command: ["python", "-Xfrozen_modules=off", "/app/scripts/gmail_monitor.py", "--mode", "monitor"]
     environment:
       DEBUGPY_ENABLE: "true"
       DEBUGPY_WAIT_FOR_CLIENT: "true"

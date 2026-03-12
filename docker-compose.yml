@@ -10,7 +10,7 @@ services:
       POSTGRES_USER: python
       POSTGRES_PASSWORD: ${PLUTONIA_DB_PASSWORD:-}
     volumes:
-      - /var/lib/plutonia/postgres:/var/lib/postgresql/data
+      - postgres-data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U python -d plutonia"]
       interval: 10s
@@ -27,7 +27,7 @@ services:
     environment:
       OLLAMA_KEEP_ALIVE: "5m"
     volumes:
-      - /usr/share/ollama/.ollama:/root/.ollama
+      - ollama-data:/root/.ollama
     healthcheck:
       test: ["CMD", "ollama", "list"]
       interval: 15s
@@ -45,8 +45,8 @@ services:
     restart: unless-stopped
     gpus: all
     volumes:
-      - /opt/plutonia/models:/comfyui/models
-      - /var/lib/plutonia/comfyui/output:/comfyui/output
+      - comfyui-models:/comfyui/models
+      - comfyui-output:/comfyui/output
     ports:
       - "127.0.0.1:8188:8188"
     healthcheck:
@@ -59,7 +59,9 @@ services:
       - ainews-net
 
   litellm:
-    image: ghcr.io/berriai/litellm:main-latest
+    build:
+      context: .
+      dockerfile: docker/litellm/Dockerfile
     container_name: plutonia-litellm-1
     restart: unless-stopped
     depends_on:
@@ -68,8 +70,6 @@ services:
     command: ["--config", "/app/config.yaml", "--port", "4000"]
     environment:
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-}
-    volumes:
-      - ./config/litellm.yaml:/app/config.yaml:ro
     ports:
       - "127.0.0.1:4000:4000"
     healthcheck:
@@ -99,15 +99,21 @@ services:
       OLLAMA_API_KEY: ollama-local
       OLLAMA_BASE_URL: http://ollama:11434
       OLLAMA_HOST: http://ollama:11434
-      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      OPENCLAW_TELEGRAM_ENABLED: "${OPENCLAW_TELEGRAM_ENABLED:-false}"
+      OPENCLAW_TELEGRAM_BOT_TOKEN: "${OPENCLAW_TELEGRAM_BOT_TOKEN:-}"
+      OPENCLAW_TELEGRAM_ALLOW_FROM: "${OPENCLAW_TELEGRAM_ALLOW_FROM:-}"
+      OPENCLAW_GATEWAY_TOKEN: "${OPENCLAW_GATEWAY_TOKEN:-}"
+      OPENCLAW_MODEL_ID: "${OPENCLAW_MODEL_ID:-qwen3:14b-16k}"
+      OPENCLAW_MODEL_NAME: "${OPENCLAW_MODEL_NAME:-qwen3:14b-16k}"
+      OPENCLAW_MODEL_CONTEXT_WINDOW: "${OPENCLAW_MODEL_CONTEXT_WINDOW:-16384}"
+      OPENCLAW_MODEL_MAX_TOKENS: "${OPENCLAW_MODEL_MAX_TOKENS:-16384}"
+      OPENCLAW_GATEWAY_REMOTE_URL: "${OPENCLAW_GATEWAY_REMOTE_URL:-ws://openclaw:18789}"
+      PLUTONIA_REVIEW_API_BASE: "http://ainews-gmail-monitor:8001"
+      REVIEW_SIGNATURE_SECRET: "${REVIEW_SIGNATURE_SECRET:-}"
     volumes:
-      - /home/python/.openclaw:/root/.openclaw
-      - /var/lib/plutonia:/var/lib/plutonia
-      - /var/backups/plutonia:/var/backups/plutonia
-      - /var/log/plutonia:/var/log/plutonia
-      - /var/run/docker.sock:/var/run/docker.sock
-    ports:
-      - "127.0.0.1:18789:18789"
+      - openclaw-data:/root/.openclaw
+    expose:
+      - "18789"
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:18789/ >/dev/null || exit 1"]
       interval: 20s
@@ -117,12 +123,78 @@ services:
     networks:
       - ainews-net
 
+  openclaw-ops:
+    container_name: plutonia-openclaw-ops
+    build:
+      context: ./docker/openclaw
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      ollama:
+        condition: service_healthy
+      portal:
+        condition: service_healthy
+      gmail-monitor:
+        condition: service_healthy
+    environment:
+      SEARXNG_URL: http://searxng:8080
+      OLLAMA_API_KEY: ollama-local
+      OLLAMA_BASE_URL: http://ollama:11434
+      OLLAMA_HOST: http://ollama:11434
+      OPS_API_TOKEN: "${OPS_API_TOKEN:-}"
+      PLUTONIA_OPS_API_BASE: "http://ainews-gmail-monitor:8001"
+      PLUTONIA_REVIEW_API_BASE: "http://ainews-gmail-monitor:8001"
+      REVIEW_SIGNATURE_SECRET: "${REVIEW_SIGNATURE_SECRET:-}"
+      OPENCLAW_TELEGRAM_ENABLED: "${OPENCLAW_OPS_TELEGRAM_ENABLED:-false}"
+      OPENCLAW_TELEGRAM_BOT_TOKEN: "${OPENCLAW_OPS_TELEGRAM_BOT_TOKEN:-}"
+      OPENCLAW_TELEGRAM_ALLOW_FROM: "${OPENCLAW_OPS_TELEGRAM_ALLOW_FROM:-}"
+      OPENCLAW_TELEGRAM_GROUPS: "${OPENCLAW_OPS_TELEGRAM_GROUPS:-}"
+      OPENCLAW_TELEGRAM_GROUP_ALLOW_FROM: "${OPENCLAW_OPS_TELEGRAM_GROUP_ALLOW_FROM:-}"
+      OPENCLAW_TELEGRAM_DM_POLICY: "${OPENCLAW_OPS_TELEGRAM_DM_POLICY:-allowlist}"
+      OPENCLAW_TELEGRAM_GROUP_POLICY: "${OPENCLAW_OPS_TELEGRAM_GROUP_POLICY:-allowlist}"
+      OPENCLAW_TELEGRAM_REQUIRE_MENTION: "${OPENCLAW_OPS_TELEGRAM_REQUIRE_MENTION:-true}"
+      OPENCLAW_GATEWAY_TOKEN: "${OPENCLAW_OPS_GATEWAY_TOKEN:-${OPENCLAW_GATEWAY_TOKEN:-}}"
+      OPENCLAW_GATEWAY_REMOTE_URL: "${OPENCLAW_OPS_GATEWAY_REMOTE_URL:-ws://openclaw-ops:18790}"
+      OPENCLAW_GATEWAY_BIND: "${OPENCLAW_OPS_GATEWAY_BIND:-lan}"
+      OPENCLAW_GATEWAY_CONTROL_UI_ALLOW_HOST_HEADER_FALLBACK: "${OPENCLAW_OPS_GATEWAY_CONTROL_UI_ALLOW_HOST_HEADER_FALLBACK:-true}"
+      OPENCLAW_MODEL_ID: "${OPENCLAW_OPS_MODEL_ID:-qwen3-coder:latest}"
+      OPENCLAW_MODEL_NAME: "${OPENCLAW_OPS_MODEL_NAME:-qwen3-coder:latest}"
+      OPENCLAW_MODEL_CONTEXT_WINDOW: "${OPENCLAW_OPS_MODEL_CONTEXT_WINDOW:-32768}"
+      OPENCLAW_MODEL_MAX_TOKENS: "${OPENCLAW_OPS_MODEL_MAX_TOKENS:-32768}"
+      OPENCLAW_AGENT_TIMEOUT_SECONDS: "${OPENCLAW_OPS_TIMEOUT_SECONDS:-1800}"
+      OPENCLAW_AGENT_WORKSPACE: /workspace
+      OPENCLAW_BOOTSTRAP_REPO_URL: "${OPENCLAW_OPS_REPO_URL:-https://github.com/padev1904/plutonia_v3.git}"
+      OPENCLAW_BOOTSTRAP_REPO_BRANCH: "${OPENCLAW_OPS_REPO_BRANCH:-main}"
+      OPENCLAW_BOOTSTRAP_REPO_DIR: /workspace/repo
+      OPENCLAW_TOOLS_PROFILE: "${OPENCLAW_OPS_TOOLS_PROFILE:-coding}"
+      OPENCLAW_WEB_FETCH_ENABLED: "${OPENCLAW_OPS_WEB_FETCH_ENABLED:-true}"
+      OPENCLAW_WEB_SEARCH_ENABLED: "${OPENCLAW_OPS_WEB_SEARCH_ENABLED:-true}"
+      OPENCLAW_WEB_SEARCH_PROVIDER: "${OPENCLAW_OPS_WEB_SEARCH_PROVIDER:-}"
+      OPENCLAW_WEB_SEARCH_API_KEY: "${OPENCLAW_OPS_WEB_SEARCH_API_KEY:-}"
+      PORTAL_PUBLIC_BASE_URL: "${PORTAL_PUBLIC_BASE_URL:-}"
+    command: ["/usr/local/bin/openclaw", "gateway", "--bind", "lan", "--port", "18790"]
+    volumes:
+      - openclaw-ops-data:/root/.openclaw
+      - openclaw-ops-workspace:/workspace
+      - review-data:/review
+      - portal-logs:/logs
+    expose:
+      - "18790"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:18790/ >/dev/null || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 10
+      start_period: 45s
+    networks:
+      - ainews-net
+
   uptime-kuma:
     image: louislam/uptime-kuma:1
     container_name: plutonia-uptime-kuma-1
     restart: unless-stopped
     volumes:
-      - /var/lib/plutonia/uptime-kuma:/app/data
+      - uptime-kuma-data:/app/data
     ports:
       - "127.0.0.1:3002:3001"
     networks:
@@ -144,13 +216,15 @@ services:
       - ainews-net
 
   searxng:
-    image: searxng/searxng:latest
+    build:
+      context: .
+      dockerfile: docker/searxng/Dockerfile
     container_name: searxng
     restart: unless-stopped
     ports:
       - "8081:8080"
     volumes:
-      - ./searxng:/etc/searxng
+      - searxng-config:/etc/searxng
       - searxng-cache:/var/cache/searxng
     networks:
       - ainews-net
@@ -188,11 +262,14 @@ services:
   gmail-monitor:
     build:
       context: .
-      dockerfile: portal/Dockerfile
+      dockerfile: docker/gmail-monitor/Dockerfile
     container_name: ainews-gmail-monitor
     expose:
       - "8001"
     restart: unless-stopped
+    labels:
+      autoheal: "true"
+      all: "true"
     env_file:
       - .env
     environment:
@@ -200,11 +277,18 @@ services:
       OLLAMA_HOST: http://ollama:11434
       SEARXNG_URL: http://searxng:8080
       LLM_BACKEND: ollama
-      OPENCLAW_CONTAINER_NAME: plutonia-openclaw
+      OPENCLAW_GATEWAY_URL: "${OPENCLAW_GATEWAY_URL:-ws://openclaw-ops:18790}"
+      OPENCLAW_GATEWAY_TOKEN: "${OPENCLAW_GATEWAY_TOKEN:-${OPENCLAW_OPS_GATEWAY_TOKEN:-}}"
+      OPENCLAW_GATEWAY_PASSWORD: "${OPENCLAW_GATEWAY_PASSWORD:-}"
+      OPENCLAW_ALLOW_INSECURE_PRIVATE_WS: "${OPENCLAW_ALLOW_INSECURE_PRIVATE_WS:-1}"
+      OPENCLAW_CONFIG_PATH: /root/.openclaw/openclaw.json
       OPENCLAW_TIMEOUT_SECONDS: "240"
       OPENCLAW_FALLBACK_OLLAMA: "false"
-      OPENCLAW_CONFIG_PATH: /openclaw-config/openclaw.json
+      OPENCLAW_SINGLE_SPOC: "${OPENCLAW_SINGLE_SPOC:-true}"
       REVIEW_BEFORE_PUBLISH: "true"
+      REVIEW_TELEGRAM_NOTIFY: "${REVIEW_TELEGRAM_NOTIFY:-false}"
+      WATCHDOG_TELEGRAM_NOTIFY: "${WATCHDOG_TELEGRAM_NOTIFY:-false}"
+      EDITORIAL_TELEGRAM_NOTIFY: "${EDITORIAL_TELEGRAM_NOTIFY:-false}"
       REVIEW_OUTPUT_DIR: /review
       REVIEW_SIGNATURE_REQUIRED: "true"
       REVIEW_SIGNATURE_MAX_AGE_SECONDS: "300"
@@ -217,12 +301,13 @@ services:
       ALLOWED_FORWARDER_EMAILS: carlos.santos@plutoanalytics.com
       GMAIL_EXCLUDED_LABELS: "Pending,Published,Partial,Rejected"
       # --- Telegram bot with inline buttons (Fase 4) ---
-      TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN}"
-      TELEGRAM_CHAT_ID: "${TELEGRAM_CHAT_ID}"
+      TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN:-${OPENCLAW_OPS_TELEGRAM_BOT_TOKEN:-}}"
+      TELEGRAM_CHAT_ID: "${TELEGRAM_CHAT_ID:-${OPENCLAW_OPS_TELEGRAM_ALLOW_FROM:-}}"
       PORTAL_PUBLIC_BASE_URL: "${PORTAL_PUBLIC_BASE_URL:-}"
       TELEGRAM_TRIAGE_NEWSLETTER_ID: "${TELEGRAM_TRIAGE_NEWSLETTER_ID:-}"
       CLOUDFLARED_CONTAINER_NAME: "${CLOUDFLARED_CONTAINER_NAME:-ainews-cloudflared}"
       TELEGRAM_TRIAGE_INTERVAL: "15"
+      TELEGRAM_INLINE_BOT_ENABLED: "${TELEGRAM_INLINE_BOT_ENABLED:-true}"
       # --- Per-task model configuration (Fase 6) ---
       OLLAMA_MODEL_SUMMARY: "${OLLAMA_MODEL_SUMMARY:-qwen3:14b}"
       OLLAMA_MODEL_TITLE: "${OLLAMA_MODEL_TITLE:-qwen3:14b}"
@@ -231,12 +316,25 @@ services:
       LINK_VALID_THRESHOLD: "${LINK_VALID_THRESHOLD:-0.75}"
       LINK_UNCERTAIN_THRESHOLD: "${LINK_UNCERTAIN_THRESHOLD:-0.45}"
       LINK_VALIDATION_TIMEOUT: "${LINK_VALIDATION_TIMEOUT:-60}"
-    command: ["python", "/opt/ai-news-scripts/gmail_monitor.py", "--mode", "monitor"]
+      MONITOR_HEALTHCHECK_STARTUP_GRACE_SECONDS: "${MONITOR_HEALTHCHECK_STARTUP_GRACE_SECONDS:-180}"
+      MONITOR_HEALTHCHECK_STALE_SECONDS: "${MONITOR_HEALTHCHECK_STALE_SECONDS:-180}"
+      MONITOR_HEALTHCHECK_FAILURES_BEFORE_RESTART: "${MONITOR_HEALTHCHECK_FAILURES_BEFORE_RESTART:-2}"
+      MONITOR_SUPERVISOR_POLL_SECONDS: "${MONITOR_SUPERVISOR_POLL_SECONDS:-15}"
+      OPS_API_TOKEN: "${OPS_API_TOKEN:-}"
+    command: ["python", "/app/scripts/gmail_monitor_supervisor.py", "--", "python", "/app/scripts/gmail_monitor.py", "--mode", "monitor"]
     volumes:
       - portal-logs:/logs
-      - ./review:/review
-      - /var/run/docker.sock:/var/run/docker.sock
-      - /home/python/.openclaw/openclaw.json:/openclaw-config/openclaw.json:ro
+      - review-data:/review
+      - type: volume
+        source: openclaw-data
+        target: /root/.openclaw
+        read_only: false
+    healthcheck:
+      test: ["CMD", "python", "/app/scripts/gmail_monitor_healthcheck.py"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 180s
     depends_on:
       portal:
         condition: service_healthy
@@ -278,6 +376,16 @@ networks:
     name: plutonia_default
 
 volumes:
+  postgres-data:
+  ollama-data:
+  comfyui-models:
+  comfyui-output:
+  uptime-kuma-data:
   portal-staticfiles:
   portal-logs:
+  review-data:
+  openclaw-data:
+  openclaw-ops-data:
+  openclaw-ops-workspace:
+  searxng-config:
   searxng-cache:

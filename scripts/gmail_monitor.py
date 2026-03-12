@@ -29,7 +29,7 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 from process_newsletter import Config, process_single_newsletter
-from review_api import start_review_api_server
+from review_api import register_ops_runtime_hooks, start_review_api_server
 
 LOG = logging.getLogger("gmail_monitor")
 
@@ -59,9 +59,27 @@ REVIEW_TELEGRAM_NOTIFY = os.getenv("REVIEW_TELEGRAM_NOTIFY", "true").strip().low
     "yes",
     "on",
 }
+WATCHDOG_TELEGRAM_NOTIFY = os.getenv("WATCHDOG_TELEGRAM_NOTIFY", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 REVIEW_TELEGRAM_BOT_TOKEN = os.getenv("REVIEW_TELEGRAM_BOT_TOKEN", "").strip()
 REVIEW_TELEGRAM_CHAT_ID = os.getenv("REVIEW_TELEGRAM_CHAT_ID", "").strip()
-OPENCLAW_CONFIG_PATH = os.getenv("OPENCLAW_CONFIG_PATH", "/home/python/.openclaw/openclaw.json")
+OPENCLAW_CONFIG_PATH = os.getenv("OPENCLAW_CONFIG_PATH", "/root/.openclaw/openclaw.json")
+OPENCLAW_SINGLE_SPOC = os.getenv("OPENCLAW_SINGLE_SPOC", "false").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+TELEGRAM_INLINE_BOT_ENABLED = os.getenv("TELEGRAM_INLINE_BOT_ENABLED", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 MANAGED_GMAIL_LABELS = ("Pending", "Published", "Partial", "Rejected")
 MANAGED_GMAIL_LABEL_KEYS = {label.casefold() for label in MANAGED_GMAIL_LABELS}
@@ -193,6 +211,8 @@ def _runtime_snapshot() -> dict[str, Any]:
 
 
 def _notify_watchdog(cfg: Config, notification_key: str, text: str) -> bool:
+    if not WATCHDOG_TELEGRAM_NOTIFY:
+        return False
     key = str(notification_key or "watchdog").strip() or "watchdog"
     now_ts = time.time()
     with _RUNTIME_STATE_LOCK:
@@ -457,6 +477,217 @@ def _observe_pipeline_state(cfg: Config) -> dict[str, Any]:
             "disk_free_pct": free_pct,
         },
     }
+
+
+def _load_watchdog_status(cfg: Config) -> dict[str, Any] | None:
+    path = _watchdog_status_path(cfg)
+    try:
+        if not path.exists():
+            return None
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return {
+            "status": "error",
+            "path": str(path),
+            "error": str(exc),
+        }
+    if not isinstance(payload, dict):
+        return {
+            "status": "error",
+            "path": str(path),
+            "error": "invalid_watchdog_payload",
+        }
+    payload.setdefault("path", str(path))
+    return payload
+
+
+def _probe_http_health(url: str, *, timeout_seconds: float = 3.0) -> dict[str, Any]:
+    target = str(url or "").strip()
+    if not target:
+        return {"ok": False, "reason": "missing_url"}
+    started = time.perf_counter()
+    try:
+        resp = requests.get(target, timeout=timeout_seconds)
+        latency_ms = round((time.perf_counter() - started) * 1000, 1)
+        return {
+            "ok": bool(resp.ok),
+            "status_code": int(resp.status_code),
+            "latency_ms": latency_ms,
+            "url": target,
+        }
+    except Exception as exc:
+        latency_ms = round((time.perf_counter() - started) * 1000, 1)
+        return {
+            "ok": False,
+            "error": str(exc),
+            "latency_ms": latency_ms,
+            "url": target,
+        }
+
+
+def _build_ops_status(cfg: Config) -> dict[str, Any]:
+    pipeline = _observe_pipeline_state(cfg)
+    return {
+        "status": "ok",
+        "observed_at": pipeline.get("observed_at") or _utcnow_iso(),
+        "pipeline": pipeline,
+        "runtime": _runtime_snapshot(),
+        "watchdog": _load_watchdog_status(cfg),
+        "services": {
+            "portal": _probe_http_health(os.getenv("PORTAL_HEALTH_URL", "http://portal:8000/healthz")),
+            "review_api": {"ok": True, "port": int(os.getenv("REVIEW_API_PORT", "8001"))},
+        },
+        "actions": {
+            "supported": [
+                "restart_monitor",
+                "notify_next_review",
+                "notify_next_resource_review",
+                "sync_gmail_labels",
+                "recover_review_gate",
+            ],
+        },
+    }
+
+
+def _handle_ops_action(cfg: Config, action: str, data: dict[str, Any]) -> tuple[dict[str, Any], int]:
+    normalized = str(action or "").strip().lower()
+
+    if normalized in {"restart_monitor", "request_monitor_restart", "monitor_restart"}:
+        reason = str(data.get("reason", "")).strip() or "ops_api_restart"
+        request = _request_monitor_restart(
+            reason,
+            requested_via="ops_api",
+            requested_by=str(data.get("requested_by", "")).strip() or "openclaw-ops",
+        )
+        runtime_action = _record_runtime_action(
+            "ops_restart_requested",
+            "Monitor restart requested via ops API",
+            reason=request.get("reason"),
+            requested_by=request.get("requested_by"),
+        )
+        return {
+            "status": "accepted",
+            "action": "restart_monitor",
+            "restart_request": request,
+            "runtime_action": runtime_action,
+        }, 202
+
+    if normalized in {"notify_next_review", "send_next_review"}:
+        newsletter_id = data.get("newsletter_id")
+        review_file = str(data.get("review_file", "")).strip()
+        resolved_newsletter_id: int | None = None
+        if newsletter_id is not None:
+            try:
+                resolved_newsletter_id = int(newsletter_id)
+            except Exception:
+                return {"error": "newsletter_id must be an integer"}, 400
+        if resolved_newsletter_id is None:
+            rows = _fetch_newsletters_by_status(
+                cfg,
+                "review",
+                limit=1,
+                mode=str(data.get("mode", "oldest")).strip() or "oldest",
+            )
+            if not rows:
+                return {"error": "no review newsletters pending notification"}, 404
+            try:
+                resolved_newsletter_id = int(rows[0].get("id") or 0)
+            except Exception:
+                resolved_newsletter_id = 0
+            if resolved_newsletter_id <= 0:
+                return {"error": "invalid review newsletter id"}, 500
+        result = send_next_review_notification(
+            cfg,
+            resolved_newsletter_id,
+            review_file=review_file or None,
+        )
+        runtime_action = _record_runtime_action(
+            "ops_notify_next_review",
+            "Ops API triggered review notification",
+            newsletter_id=resolved_newsletter_id,
+            sent=bool(result.get("sent")),
+            reason=result.get("reason"),
+        )
+        return {
+            "status": "ok",
+            "action": "notify_next_review",
+            "result": result,
+            "runtime_action": runtime_action,
+        }, 200
+
+    if normalized in {"notify_next_resource_review", "send_next_resource_review"}:
+        from review_api import _notify_next_pending_resource_review
+
+        result = _notify_next_pending_resource_review(cfg)
+        runtime_action = _record_runtime_action(
+            "ops_notify_next_resource_review",
+            "Ops API triggered resource review notification",
+            sent=bool(result.get("sent")),
+            reason=result.get("reason"),
+        )
+        return {
+            "status": "ok",
+            "action": "notify_next_resource_review",
+            "result": result,
+            "runtime_action": runtime_action,
+        }, 200
+
+    if normalized in {"sync_gmail_labels", "reconcile_gmail_labels"}:
+        status_value = str(data.get("status", "review")).strip().lower()
+        if status_value not in {"review", "completed"}:
+            return {"error": "status must be review|completed"}, 400
+        mode_value = str(data.get("mode", "oldest")).strip().lower() or "oldest"
+        try:
+            limit_value = max(1, min(100, int(data.get("limit", 10))))
+        except Exception:
+            return {"error": "limit must be an integer"}, 400
+        result = _sync_status_gmail_labels(cfg, status=status_value, mode=mode_value, limit=limit_value)
+        runtime_action = _record_runtime_action(
+            "ops_sync_gmail_labels",
+            "Ops API reconciled gmail labels",
+            status=status_value,
+            synced=result.get("synced"),
+            changed=result.get("changed"),
+        )
+        return {
+            "status": "ok",
+            "action": "sync_gmail_labels",
+            "result": result,
+            "runtime_action": runtime_action,
+        }, 200
+
+    if normalized in {"recover_review_gate", "review_recovery"}:
+        try:
+            limit_value = max(1, min(500, int(data.get("limit", 200))))
+        except Exception:
+            return {"error": "limit must be an integer"}, 400
+        result = _recover_review_gate_startup(cfg, limit=limit_value)
+        runtime_action = _record_runtime_action(
+            "ops_recover_review_gate",
+            "Ops API ran review gate recovery",
+            limit=limit_value,
+            requeued_pending=result.get("requeued_pending"),
+            completed=result.get("completed"),
+            renotified=result.get("renotified"),
+            errors=result.get("errors"),
+        )
+        return {
+            "status": "ok",
+            "action": "recover_review_gate",
+            "result": result,
+            "runtime_action": runtime_action,
+        }, 200
+
+    return {
+        "error": f"unsupported action: {normalized}",
+        "supported_actions": [
+            "restart_monitor",
+            "notify_next_review",
+            "notify_next_resource_review",
+            "sync_gmail_labels",
+            "recover_review_gate",
+        ],
+    }, 400
 
 
 def _write_watchdog_status(cfg: Config, payload: dict[str, Any]) -> None:
@@ -1512,18 +1743,16 @@ def _resolve_telegram_config(cfg: Config) -> tuple[str, str]:
         except Exception as exc:
             LOG.warning("failed to parse openclaw config path=%s err=%s", path, exc)
 
-    try:
-        import docker  # Lazy import to avoid hard dependency when notifications are disabled.
+    # NÃ£o cachear vazio para permitir retries em ciclos seguintes.
+    # Host Docker introspection is intentionally disabled for this runtime.
+    return "", ""
 
-        client = docker.from_env()
-        container = client.containers.get(cfg.openclaw_container_name)
-        exec_result = container.exec_run(
-            ["cat", "/root/.openclaw/openclaw.json"],
-            stdout=True,
-            stderr=True,
-            demux=False,
-            tty=False,
-        )
+    try:
+        raise RuntimeError("host Docker introspection disabled")
+
+        client = None
+        container = None
+        exec_result = None
         if isinstance(exec_result, tuple):
             exit_code, raw_output = exec_result
         else:
@@ -1537,7 +1766,7 @@ def _resolve_telegram_config(cfg: Config) -> tuple[str, str]:
                 _TELEGRAM_CONFIG_CACHE = (token, chat_id)
                 return _TELEGRAM_CONFIG_CACHE
     except Exception as exc:
-        LOG.warning("failed to resolve telegram config via container=%s err=%s", cfg.openclaw_container_name, exc)
+        LOG.warning("telegram config fallback unavailable err=%s", exc)
 
     # Não cachear vazio para permitir retries em ciclos seguintes.
     return "", ""
@@ -2525,12 +2754,18 @@ def cleanup_zombie_tasks():
         LOG.warning("cleanup_zombie_tasks failed err=%s", exc)
 
 def _start_telegram_bot_thread(cfg: Config) -> tuple[threading.Thread | None, bool]:
+    if not TELEGRAM_INLINE_BOT_ENABLED:
+        LOG.info("telegram bot disabled (TELEGRAM_INLINE_BOT_ENABLED=false)")
+        return None, False
     try:
         from telegram_bot import run_telegram_bot_thread, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
         if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
             thread = run_telegram_bot_thread(cfg)
-            LOG.info("telegram bot thread started")
+            if OPENCLAW_SINGLE_SPOC:
+                LOG.info("telegram unified frontend thread started (single SPOC mode)")
+            else:
+                LOG.info("telegram bot thread started")
             return thread, True
         LOG.info("telegram bot disabled (TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set)")
     except ImportError:
@@ -2542,14 +2777,23 @@ def _start_telegram_bot_thread(cfg: Config) -> tuple[threading.Thread | None, bo
 
 def run_monitor_parallel_mode(cfg: Config, gmail_address: str, gmail_app_password: str) -> None:
     _refresh_watchdog_settings()
+    global REVIEW_TELEGRAM_NOTIFY
+    global WATCHDOG_TELEGRAM_NOTIFY
+    if OPENCLAW_SINGLE_SPOC:
+        REVIEW_TELEGRAM_NOTIFY = False
+        WATCHDOG_TELEGRAM_NOTIFY = False
     cleanup_zombie_tasks()
+    register_ops_runtime_hooks(
+        status_provider=lambda: _build_ops_status(cfg),
+        action_handler=lambda action, data: _handle_ops_action(cfg, action, data),
+    )
     start_review_api_server()
 
     telegram_bot_thread, telegram_bot_active = _start_telegram_bot_thread(cfg)
 
     if telegram_bot_active:
-        global REVIEW_TELEGRAM_NOTIFY
         REVIEW_TELEGRAM_NOTIFY = False
+        WATCHDOG_TELEGRAM_NOTIFY = False
         LOG.info("old plain-text telegram notifications disabled (inline bot is active)")
 
     recovery = _recover_review_gate_startup(cfg)

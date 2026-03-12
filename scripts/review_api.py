@@ -27,7 +27,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -51,8 +51,21 @@ REVIEW_RESOURCE_EDITORIAL_REWRITE = os.getenv("REVIEW_RESOURCE_EDITORIAL_REWRITE
     "on",
 }
 REVIEW_RESOURCE_EDITORIAL_MIN_SOURCE_CHARS = int(os.getenv("REVIEW_RESOURCE_EDITORIAL_MIN_SOURCE_CHARS", "800"))
+OPS_API_TOKEN = os.getenv("OPS_API_TOKEN", "").strip()
+OPENCLAW_SINGLE_SPOC = os.getenv("OPENCLAW_SINGLE_SPOC", "false").strip().lower() in {"1", "true", "yes", "on"}
 _SEEN_NONCES: dict[str, int] = {}
 _NONCE_LOCK = threading.Lock()
+_OPS_RUNTIME_LOCK = threading.Lock()
+_OPS_STATUS_PROVIDER: Callable[[], dict[str, Any]] | None = None
+_OPS_ACTION_HANDLER: Callable[[str, dict[str, Any]], tuple[dict[str, Any], int]] | None = None
+_EDITORIAL_ACTIVE_STATUSES = {
+    "awaiting_triage",
+    "awaiting_llm",
+    "pending_approval",
+    "waiting_user_input",
+    "waiting_edit",
+    "blocked_llm",
+}
 
 REVIEW_RESOURCE_CLASSIFICATION_PROMPT = """Classify one AI resource into taxonomy fields.
 
@@ -158,6 +171,41 @@ def _send_json(handler: BaseHTTPRequestHandler, data: dict, status: int = 200) -
     handler.send_header("Content-Length", str(len(body)))
     handler.end_headers()
     handler.wfile.write(body)
+
+
+def register_ops_runtime_hooks(
+    *,
+    status_provider: Callable[[], dict[str, Any]] | None = None,
+    action_handler: Callable[[str, dict[str, Any]], tuple[dict[str, Any], int]] | None = None,
+) -> None:
+    with _OPS_RUNTIME_LOCK:
+        global _OPS_STATUS_PROVIDER
+        global _OPS_ACTION_HANDLER
+        _OPS_STATUS_PROVIDER = status_provider
+        _OPS_ACTION_HANDLER = action_handler
+
+
+def _ops_auth_error(handler: BaseHTTPRequestHandler) -> dict[str, Any] | None:
+    token = OPS_API_TOKEN
+    if not token:
+        return None
+    provided = str(handler.headers.get("X-Ops-Token", "")).strip()
+    if not provided:
+        auth_header = str(handler.headers.get("Authorization", "")).strip()
+        if auth_header.lower().startswith("bearer "):
+            provided = auth_header[7:].strip()
+    if provided == token:
+        return None
+    return {"error": "invalid ops token"}
+
+
+def _ops_runtime_hooks() -> tuple[Callable[[], dict[str, Any]] | None, Callable[[str, dict[str, Any]], tuple[dict[str, Any], int]] | None]:
+    with _OPS_RUNTIME_LOCK:
+        return _OPS_STATUS_PROVIDER, _OPS_ACTION_HANDLER
+
+
+def _telegram_direct_send_allowed() -> bool:
+    return not OPENCLAW_SINGLE_SPOC
 
 
 def _normalize_article_decision(value: str) -> str:
@@ -1658,6 +1706,8 @@ def _http_validate_url(url: str, *, expected_title: str = "", timeout: int = 12)
 
 
 def _notify_public_article_links(cfg: Config, result: dict[str, Any]) -> dict[str, Any]:
+    if not _telegram_direct_send_allowed():
+        return {"sent": False, "reason": "single_spoc_enabled"}
     try:
         from gmail_monitor import _resolve_telegram_config, _send_telegram_message
     except Exception as exc:
@@ -1725,6 +1775,14 @@ def _notify_public_article_links(cfg: Config, result: dict[str, Any]) -> dict[st
 
 
 def _notify_resource_review(cfg: Config, resource: dict[str, Any]) -> dict[str, Any]:
+    if not _telegram_direct_send_allowed():
+        rid = resource.get("id") if isinstance(resource, dict) else None
+        if rid is not None:
+            try:
+                _portal_api_post(cfg, "resources/review-notified/", {"resource_id": int(rid)})
+            except Exception as exc:
+                LOG.warning("resource review notify mark failed resource_id=%s err=%s", rid, exc)
+        return {"sent": False, "reason": "single_spoc_enabled", "resource_id": rid}
     try:
         from gmail_monitor import _resolve_telegram_config, _send_telegram_message
     except Exception as exc:
@@ -2427,6 +2485,601 @@ def _handle_resource_decision(data: dict) -> tuple[dict, int]:
     return out, 200
 
 
+def _handle_ops_status() -> tuple[dict, int]:
+    status_provider, _ = _ops_runtime_hooks()
+    if status_provider is None:
+        return {
+            "status": "degraded",
+            "message": "ops runtime hooks not registered",
+            "review_api": {"status": "ok"},
+        }, 503
+    payload = status_provider()
+    if not isinstance(payload, dict):
+        return {
+            "status": "error",
+            "message": "ops runtime status provider returned invalid payload",
+        }, 500
+    return payload, 200
+
+
+def _handle_ops_action(data: dict) -> tuple[dict, int]:
+    _, action_handler = _ops_runtime_hooks()
+    if action_handler is None:
+        return {
+            "error": "ops action handler unavailable",
+            "status": "degraded",
+        }, 503
+    action = str(data.get("action", "")).strip().lower()
+    if not action:
+        return {"error": "missing action"}, 400
+    return action_handler(action, data)
+
+
+def _editorial_status_payload(article: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "article_id": article.get("id"),
+        "newsletter_id": article.get("newsletter_id"),
+        "telegram_triage_status": str(article.get("telegram_triage_status", "")).strip(),
+        "content_profile": str(article.get("content_profile", "")).strip() or "news",
+        "source_link_origin": str(article.get("source_link_origin", "")).strip() or "email",
+        "link_validation_status": str(article.get("link_validation_status", "")).strip() or "not_checked",
+        "link_validation_confidence": float(article.get("link_validation_confidence", 0.0) or 0.0),
+        "original_url": str(article.get("original_url", "")).strip(),
+    }
+
+
+def _editorial_phase(article: dict[str, Any] | None) -> str:
+    if not isinstance(article, dict) or not article:
+        return "idle"
+    tg_status = str(article.get("telegram_triage_status", "")).strip().lower()
+    if tg_status in {"", "not_sent", "awaiting_triage"}:
+        return "triage"
+    if tg_status == "pending_approval":
+        return "preview"
+    if tg_status == "waiting_edit":
+        return "waiting_edit"
+    if tg_status == "waiting_user_input":
+        return "waiting_user_input"
+    if tg_status == "awaiting_llm":
+        return "awaiting_llm"
+    if tg_status == "blocked_llm":
+        return "blocked_llm"
+    if tg_status == "approved":
+        return "approved"
+    if tg_status == "rejected":
+        return "rejected"
+    return "triage"
+
+
+def _editorial_allowed_actions(phase: str, article: dict[str, Any]) -> list[str]:
+    if phase == "triage":
+        actions = ["prepare_preview", "reject_article"]
+        process_url = str(article.get("original_url", "")).strip()
+        if process_url.startswith(("http://", "https://")):
+            actions.append("prepare_preview_process")
+        actions.append("prepare_preview_manual")
+        return actions
+    if phase == "waiting_user_input":
+        return ["provide_source", "provide_text", "reject_article"]
+    if phase in {"preview", "waiting_edit"}:
+        return ["approve_preview", "request_changes", "reject_article"]
+    if phase in {"awaiting_llm", "blocked_llm"}:
+        return ["restart_monitor", "recover_review_gate"]
+    return []
+
+
+def _editorial_status_label(status: str) -> str:
+    mapping = {
+        "valid": "validated",
+        "invalid": "invalid",
+        "uncertain": "uncertain",
+        "not_checked": "not checked",
+    }
+    return mapping.get(str(status or "").strip().lower(), str(status or "").strip() or "not checked")
+
+
+def _load_newsletter_meta_for_editorial(cfg: Config, newsletter_id: int | None) -> dict[str, Any]:
+    if not newsletter_id:
+        return {}
+    try:
+        payload = _portal_api_get(cfg, f"newsletter/{int(newsletter_id)}/raw/")
+    except Exception as exc:
+        LOG.warning("failed to load newsletter meta newsletter_id=%s err=%s", newsletter_id, exc)
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        "subject": str(payload.get("subject", "")).strip(),
+        "original_sender_name": str(payload.get("original_sender_name", "")).strip(),
+        "original_sender_email": str(payload.get("original_sender_email", "")).strip(),
+    }
+
+
+def _format_editorial_triage_message(article: dict[str, Any], newsletter_meta: dict[str, Any]) -> str:
+    title = str(article.get("title", "")).strip() or "Sem titulo"
+    proposed = str(article.get("proposed_title", "")).strip() or title
+    current_profile = str(article.get("content_profile", "")).strip().lower() or "news"
+    source_origin = str(article.get("source_link_origin", "")).strip().lower() or "email"
+    source_label = "manual" if source_origin == "user" else "process"
+    source_url = str(article.get("original_url", "")).strip() or "por definir"
+    reason = str(article.get("link_validation_reason", "")).strip()
+    summary = str(article.get("summary", "")).strip()
+    first_words = " ".join(summary.split()[:25]) if summary else "(sem resumo)"
+
+    lines = ["Triagem editorial"]
+    subject = str(newsletter_meta.get("subject", "")).strip()
+    sender = str(newsletter_meta.get("original_sender_name", "")).strip() or str(newsletter_meta.get("original_sender_email", "")).strip()
+    if subject:
+        lines.append(f"Email: {subject}")
+    if sender:
+        lines.append(f"Sender: {sender}")
+    lines.extend(
+        [
+            f"Titulo original: {title}",
+            f"Titulo (modelo): {proposed}",
+            f"Tipo atual: {'Resource' if current_profile == 'resource' else 'News'}",
+            f"Source atual: {'Manual' if source_label == 'manual' else 'Processo'}",
+            f"Link atual: {source_url}",
+            f"Validacao link: {_editorial_status_label(str(article.get('link_validation_status', '')))}",
+            f"Confianca: {float(article.get('link_validation_confidence', 0.0) or 0.0):.0%}",
+        ]
+    )
+    if reason:
+        lines.append(f"Motivo: {reason[:220]}")
+    lines.extend(
+        [
+            "",
+            f"Resumo: {first_words}...",
+            "",
+            "Acoes permitidas: prepare_preview, prepare_preview_manual <url>, reject_article",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _format_editorial_preview_message(article: dict[str, Any]) -> str:
+    profile_label = "RECURSO" if str(article.get("content_profile", "")).strip().lower() == "resource" else "NOTICIA"
+    taxonomy = " > ".join(
+        [
+            item
+            for item in (
+                str(article.get("section", "")).strip(),
+                str(article.get("category", "")).strip(),
+                str(article.get("subcategory", "")).strip(),
+            )
+            if item
+        ]
+    ) or "Sem categoria"
+    card_url = _build_external_preview_url(str(article.get("preview_card_path", "")).strip())
+    source_url = str(article.get("original_url", "")).strip()
+    lines = [
+        f"Preview privado [{profile_label}]",
+        str(article.get("title", "")).strip() or "Sem titulo",
+        taxonomy,
+    ]
+    if card_url:
+        lines.append(f"Card: {card_url}")
+    if source_url.startswith(("http://", "https://")):
+        lines.append(f"Fonte: {source_url}")
+    lines.extend(
+        [
+            "",
+            "Acoes permitidas: approve_preview, request_changes <instrucoes>, reject_article",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _format_editorial_waiting_input_message(article: dict[str, Any]) -> str:
+    source_url = str(article.get("original_url", "")).strip()
+    lines = [
+        "Input manual necessario",
+        str(article.get("title", "")).strip() or "Sem titulo",
+    ]
+    if source_url:
+        lines.append(f"Link atual: {source_url}")
+    lines.extend(
+        [
+            "",
+            "Envia um URL manual completo ou o texto integral do artigo.",
+            "Acoes permitidas: provide_source <url>, provide_text <texto>, reject_article",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _format_editorial_waiting_edit_message(article: dict[str, Any]) -> str:
+    return "\n".join(
+        [
+            _format_editorial_preview_message(article),
+            "",
+            "O artigo esta a aguardar instrucoes concretas de alteracao ao preview.",
+        ]
+    )
+
+
+def _prime_editorial_article(cfg: Config, article: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(article, dict) or not article:
+        return {}
+    try:
+        article_id = int(article.get("id") or 0)
+    except Exception:
+        article_id = 0
+    if article_id <= 0:
+        return article
+
+    source_url = str(article.get("original_url", "")).strip()
+    summary = str(article.get("summary", "")).strip()
+    title = str(article.get("title", "")).strip()
+    newsletter_meta = _load_newsletter_meta_for_editorial(cfg, article.get("newsletter_id"))
+
+    validation_result: dict[str, Any] | None = None
+    link_model = cfg.ollama_model_link_validation or cfg.ollama_model_summary or cfg.required_summary_model
+    if source_url.startswith(("http://", "https://")):
+        try:
+            from link_validator import run_link_validation
+
+            validation_result = run_link_validation(
+                cfg.ollama_url,
+                link_model,
+                cfg.searxng_url,
+                str(newsletter_meta.get("subject", "")).strip() or title,
+                summary[:500],
+                source_url,
+            )
+        except Exception as exc:
+            LOG.warning("editorial prime link validation failed article_id=%s err=%s", article_id, exc)
+            validation_result = {
+                "status": "uncertain",
+                "confidence": 0.0,
+                "reason": f"Erro: {str(exc)[:120]}",
+                "origin": "email",
+                "final_link": source_url,
+            }
+
+    proposed_title = str(article.get("proposed_title", "")).strip() or title
+    if not str(article.get("proposed_title", "")).strip():
+        try:
+            from telegram_bot import propose_title
+
+            llm_title = propose_title(cfg, summary or title, str(article.get("content_profile", "news")).strip() or "news")
+            if llm_title:
+                proposed_title = llm_title
+        except Exception as exc:
+            LOG.warning("editorial prime title proposal failed article_id=%s err=%s", article_id, exc)
+
+    persist_payload: dict[str, Any] = {
+        "article_id": article_id,
+        "telegram_triage_status": "awaiting_triage",
+        "proposed_title": proposed_title,
+    }
+    if validation_result:
+        persist_payload.update(
+            {
+                "link_validation_status": validation_result.get("status", "uncertain"),
+                "link_validation_confidence": validation_result.get("confidence", 0.0),
+                "link_validation_reason": validation_result.get("reason", ""),
+                "source_link_origin": validation_result.get("origin", "email"),
+            }
+        )
+        final_link = str(validation_result.get("final_link", "")).strip()
+        if final_link and final_link != "NEEDS_USER_LINK":
+            persist_payload["original_url"] = final_link
+
+    try:
+        _portal_api_post(cfg, "articles/link-validation/", persist_payload)
+        refreshed = _portal_api_get(cfg, "articles/editorial-data/", {"article_id": article_id})
+        fresh_article = refreshed.get("article") if isinstance(refreshed, dict) else None
+        if isinstance(fresh_article, dict) and fresh_article:
+            return fresh_article
+    except Exception as exc:
+        LOG.warning("editorial prime persist failed article_id=%s err=%s", article_id, exc)
+    article["telegram_triage_status"] = "awaiting_triage"
+    article["proposed_title"] = proposed_title
+    if validation_result:
+        article["link_validation_status"] = validation_result.get("status", "uncertain")
+        article["link_validation_confidence"] = validation_result.get("confidence", 0.0)
+        article["link_validation_reason"] = validation_result.get("reason", "")
+        article["source_link_origin"] = validation_result.get("origin", "email")
+        final_link = str(validation_result.get("final_link", "")).strip()
+        if final_link and final_link != "NEEDS_USER_LINK":
+            article["original_url"] = final_link
+    return article
+
+
+def _build_editorial_session_payload(cfg: Config) -> dict[str, Any]:
+    pending_payload = _portal_api_get(cfg, "articles/editorial-pending/", {"mode": "oldest", "exclude_tg_triaged": "true"})
+    article = pending_payload.get("article") if isinstance(pending_payload, dict) else None
+    if not isinstance(article, dict) or not article:
+        return {
+            "status": "idle",
+            "phase": "idle",
+            "reason": str(pending_payload.get("reason", "")) if isinstance(pending_payload, dict) else "no_pending_editorial_articles",
+            "article": None,
+            "allowed_actions": [],
+            "prompt": "Nao ha artigos editoriais pendentes.",
+        }
+
+    tg_status = str(article.get("telegram_triage_status", "")).strip().lower()
+    if tg_status in {"", "not_sent"}:
+        article = _prime_editorial_article(cfg, article)
+
+    phase = _editorial_phase(article)
+    newsletter_meta = _load_newsletter_meta_for_editorial(cfg, article.get("newsletter_id"))
+
+    if phase == "triage":
+        prompt = _format_editorial_triage_message(article, newsletter_meta)
+    elif phase == "waiting_user_input":
+        prompt = _format_editorial_waiting_input_message(article)
+    elif phase == "waiting_edit":
+        prompt = _format_editorial_waiting_edit_message(article)
+    else:
+        prompt = _format_editorial_preview_message(article)
+
+    return {
+        "status": "ok",
+        "phase": phase,
+        "reason": str(pending_payload.get("reason", "")) if isinstance(pending_payload, dict) else "",
+        "article": article,
+        "newsletter_meta": newsletter_meta,
+        "allowed_actions": _editorial_allowed_actions(phase, article),
+        "prompt": prompt,
+        "state": _editorial_status_payload(article),
+    }
+
+
+def _resolve_editorial_article(cfg: Config, article_id: Any | None) -> tuple[dict[str, Any] | None, tuple[dict[str, Any], int] | None]:
+    if article_id is not None:
+        try:
+            resolved_article_id = int(article_id)
+        except (TypeError, ValueError):
+            return None, ({"error": "article_id must be an integer"}, 400)
+        fetched = _portal_api_get(cfg, "articles/editorial-data/", {"article_id": resolved_article_id})
+        article = fetched.get("article") if isinstance(fetched, dict) else None
+        if not isinstance(article, dict):
+            return None, ({"error": "article not found"}, 404)
+        return article, None
+
+    session = _build_editorial_session_payload(cfg)
+    article = session.get("article") if isinstance(session, dict) else None
+    if not isinstance(article, dict):
+        return None, ({"status": "no_pending_context", "message": "No active editorial article."}, 200)
+    return article, None
+
+
+def _publish_resource_from_editorial_article(cfg: Config, article: dict[str, Any]) -> dict[str, Any]:
+    original_date = (
+        str(article.get("newsletter_original_sent_at", "")).strip()
+        or str(article.get("newsletter_received_at", "")).strip()
+        or str(article.get("published_at", "")).strip()
+    )
+    payload = {
+        "resource_url": str(article.get("original_url", "")).strip(),
+        "title": str(article.get("title", "")).strip(),
+        "summary": str(article.get("summary", "")).strip(),
+        "article_body": str(article.get("article_body", "")).strip(),
+        "image_url": str(article.get("image_url", "")).strip(),
+        "section": str(article.get("section", "")).strip(),
+        "category": str(article.get("category", "")).strip(),
+        "subcategory": str(article.get("subcategory", "")).strip(),
+        "review_status": "approved",
+        "is_active": True,
+        "published_at": original_date,
+        "source_published_at": original_date,
+    }
+    result = _portal_api_post(cfg, "resources/publish/", payload)
+    resource = result.get("resource") if isinstance(result, dict) else None
+    if not isinstance(resource, dict) or not resource:
+        raise RuntimeError("resource publish returned no resource payload")
+    return resource
+
+
+def _format_publication_confirmation(article: dict[str, Any], resource: dict[str, Any] | None = None) -> str:
+    title = str(article.get("title", "")).strip() or "Sem titulo"
+    lines = [
+        "Publicacao aprovada",
+        f"Titulo: {title}",
+    ]
+    if str(article.get("content_profile", "news")).strip().lower() == "resource" and isinstance(resource, dict):
+        resource_id = resource.get("id")
+        public_url = _build_external_public_url(f"/resources/item/{int(resource_id)}/") if resource_id else ""
+        lines.append(f"Recurso: {public_url or 'link publico indisponivel'}")
+    else:
+        article_id = article.get("id")
+        public_url = _build_external_public_url(f"/article/{int(article_id)}/card/") if article_id else ""
+        lines.append(f"Card: {public_url or 'link publico indisponivel'}")
+    return "\n".join(lines)
+
+
+def _handle_editorial_session() -> tuple[dict[str, Any], int]:
+    cfg = Config()
+    if not cfg.agent_api_key:
+        return {"error": "AGENT_API_KEY missing"}, 500
+    try:
+        return _build_editorial_session_payload(cfg), 200
+    except Exception as exc:
+        LOG.exception("editorial session failed")
+        return {"error": f"editorial session failed: {exc}"}, 500
+
+
+def _handle_editorial_action(data: dict[str, Any]) -> tuple[dict[str, Any], int]:
+    cfg = Config()
+    if not cfg.agent_api_key:
+        return {"error": "AGENT_API_KEY missing"}, 500
+
+    action = str(data.get("action", "")).strip().lower()
+    if not action:
+        return {"error": "missing action"}, 400
+
+    article, error = _resolve_editorial_article(cfg, data.get("article_id"))
+    if error is not None:
+        return error
+    assert article is not None
+    article_id = int(article.get("id") or 0)
+
+    if action in {"prepare_preview", "prepare_preview_process", "prepare_preview_manual", "provide_source"}:
+        requested_profile = str(data.get("content_profile", "")).strip().lower() or str(article.get("content_profile", "")).strip().lower() or "news"
+        if requested_profile not in {"news", "resource"}:
+            return {"error": "content_profile must be news|resource"}, 400
+
+        source_mode = str(data.get("source_mode", "")).strip().lower()
+        if action == "prepare_preview_process":
+            source_mode = "process"
+        elif action in {"prepare_preview_manual", "provide_source"}:
+            source_mode = "manual"
+        if source_mode not in {"", "process", "manual"}:
+            return {"error": "source_mode must be process|manual"}, 400
+        if not source_mode:
+            source_mode = "process"
+
+        manual_url = str(data.get("manual_url") or data.get("url") or "").strip()
+        if source_mode == "manual":
+            if not manual_url.startswith(("http://", "https://")):
+                return {
+                    "status": "needs_input",
+                    "phase": "waiting_user_input",
+                    "required": "manual_url",
+                    "message": "A manual source URL is required to prepare the preview.",
+                }, 200
+            source_url = manual_url
+            source_origin = "user"
+            validation_status = "valid"
+            validation_confidence = 1.0
+            validation_reason = "Link manual fornecido pelo utilizador."
+        else:
+            source_url = str(article.get("original_url", "")).strip()
+            if not source_url.startswith(("http://", "https://")):
+                return {
+                    "status": "needs_input",
+                    "phase": "waiting_user_input",
+                    "required": "manual_url",
+                    "message": "O link do processo nao esta disponivel; e preciso um URL manual.",
+                }, 200
+            source_origin = str(article.get("source_link_origin", "")).strip().lower()
+            if source_origin not in {"email", "search"}:
+                source_origin = "email"
+            validation_status = str(article.get("link_validation_status", "not_checked")).strip() or "not_checked"
+            validation_confidence = float(article.get("link_validation_confidence", 0.0) or 0.0)
+            validation_reason = str(article.get("link_validation_reason", "")).strip()
+
+        _portal_api_post(
+            cfg,
+            "articles/link-validation/",
+            {
+                "article_id": article_id,
+                "telegram_triage_status": "pending_approval",
+                "content_profile": requested_profile,
+                "original_url": source_url,
+                "source_link_origin": source_origin,
+                "link_validation_status": validation_status,
+                "link_validation_confidence": validation_confidence,
+                "link_validation_reason": validation_reason,
+            },
+        )
+        refreshed = _portal_api_get(cfg, "articles/editorial-data/", {"article_id": article_id})
+        updated_article = refreshed.get("article") if isinstance(refreshed, dict) else article
+        payload = _build_editorial_session_payload(cfg)
+        payload.update(
+            {
+                "action": action,
+                "message": _format_editorial_preview_message(updated_article if isinstance(updated_article, dict) else article),
+            }
+        )
+        return payload, 200
+
+    if action == "provide_text":
+        source_text = str(data.get("text", "")).strip()
+        if not source_text:
+            return {"error": "text is required"}, 400
+        _portal_api_post(
+            cfg,
+            "articles/editorial-decision/",
+            {
+                "article_id": article_id,
+                "decision": "revise",
+                "article_body": source_text,
+            },
+        )
+        _portal_api_post(
+            cfg,
+            "articles/link-validation/",
+            {
+                "article_id": article_id,
+                "telegram_triage_status": "awaiting_triage",
+            },
+        )
+        payload = _build_editorial_session_payload(cfg)
+        payload.update({"action": action, "message": "Texto recebido. O artigo voltou para triagem."})
+        return payload, 200
+
+    if action == "request_changes":
+        instructions = str(data.get("instructions", "")).strip()
+        if not instructions:
+            return {"error": "instructions are required"}, 400
+        from review_content_decision import _build_revision_payload
+
+        source_text = str(data.get("source_text", "")).strip()
+        max_source_chars = int(data.get("max_source_chars", 12000))
+        revision_payload = _build_revision_payload(cfg, article, instructions, source_text, max_source_chars)
+        revision_payload["article_id"] = article_id
+        result = _portal_api_post(cfg, "articles/editorial-decision/", revision_payload)
+        _portal_api_post(
+            cfg,
+            "articles/link-validation/",
+            {
+                "article_id": article_id,
+                "telegram_triage_status": "pending_approval",
+            },
+        )
+        updated_article = result.get("article") if isinstance(result, dict) else None
+        if not isinstance(updated_article, dict) or not updated_article:
+            refreshed = _portal_api_get(cfg, "articles/editorial-data/", {"article_id": article_id})
+            updated_article = refreshed.get("article") if isinstance(refreshed, dict) else article
+        payload = _build_editorial_session_payload(cfg)
+        payload.update(
+            {
+                "action": action,
+                "message": "Preview atualizado.",
+                "preview": _format_editorial_preview_message(updated_article if isinstance(updated_article, dict) else article),
+            }
+        )
+        return payload, 200
+
+    if action == "approve_preview":
+        article_before = article
+        result = _portal_api_post(cfg, "articles/editorial-decision/", {"article_id": article_id, "decision": "approve"})
+        updated_article = result.get("article") if isinstance(result, dict) else None
+        if not isinstance(updated_article, dict) or not updated_article:
+            updated_article = article_before
+        resource_payload = None
+        if str(updated_article.get("content_profile", article_before.get("content_profile", "news"))).strip().lower() == "resource":
+            resource_payload = _publish_resource_from_editorial_article(cfg, updated_article or article_before)
+        _portal_api_post(cfg, "articles/link-validation/", {"article_id": article_id, "telegram_triage_status": "approved"})
+        next_session = _build_editorial_session_payload(cfg)
+        return {
+            "status": "ok",
+            "action": action,
+            "article": updated_article,
+            "resource": resource_payload,
+            "message": _format_publication_confirmation(updated_article if isinstance(updated_article, dict) else article_before, resource_payload),
+            "next_session": next_session,
+        }, 200
+
+    if action == "reject_article":
+        _portal_api_post(cfg, "articles/editorial-decision/", {"article_id": article_id, "decision": "reject"})
+        _portal_api_post(cfg, "articles/link-validation/", {"article_id": article_id, "telegram_triage_status": "rejected"})
+        next_session = _build_editorial_session_payload(cfg)
+        return {
+            "status": "ok",
+            "action": action,
+            "article_id": article_id,
+            "message": "Artigo rejeitado.",
+            "next_session": next_session,
+        }, 200
+
+    return {"error": f"unsupported editorial action: {action}"}, 400
+
+
 # ---------------------------------------------------------------------------
 # HTTP Server
 # ---------------------------------------------------------------------------
@@ -2438,8 +3091,23 @@ class ReviewAPIHandler(BaseHTTPRequestHandler):
         LOG.info("review_api %s", format % args)
 
     def do_GET(self):  # noqa: N802
-        if self.path == "/healthz":
+        path = urlparse(self.path).path
+        if path == "/healthz":
             _send_json(self, {"status": "ok"})
+        elif path == "/api/editorial/session":
+            auth_err = _ops_auth_error(self)
+            if auth_err is not None:
+                _send_json(self, auth_err, 401)
+                return
+            result, status = _handle_editorial_session()
+            _send_json(self, result, status)
+        elif path == "/api/ops/status":
+            auth_err = _ops_auth_error(self)
+            if auth_err is not None:
+                _send_json(self, auth_err, 401)
+                return
+            result, status = _handle_ops_status()
+            _send_json(self, result, status)
         else:
             _send_json(self, {"error": "not found"}, 404)
 
@@ -2450,22 +3118,35 @@ class ReviewAPIHandler(BaseHTTPRequestHandler):
             _send_json(self, {"error": f"invalid JSON body: {exc}"}, 400)
             return
 
+        path = urlparse(self.path).path
         try:
-            if self.path == "/api/review/article-decision":
+            if path == "/api/review/article-decision":
                 result, status = _handle_article_decision(data)
-            elif self.path == "/api/review/content-decision":
+            elif path == "/api/review/content-decision":
                 result, status = _handle_content_decision(data)
-            elif self.path == "/api/review/resource-submit":
+            elif path == "/api/review/resource-submit":
                 result, status = _handle_resource_submit(data)
-            elif self.path == "/api/review/resource-decision":
+            elif path == "/api/review/resource-decision":
                 result, status = _handle_resource_decision(data)
+            elif path == "/api/editorial/action":
+                auth_err = _ops_auth_error(self)
+                if auth_err is not None:
+                    _send_json(self, auth_err, 401)
+                    return
+                result, status = _handle_editorial_action(data)
+            elif path == "/api/ops/action":
+                auth_err = _ops_auth_error(self)
+                if auth_err is not None:
+                    _send_json(self, auth_err, 401)
+                    return
+                result, status = _handle_ops_action(data)
             else:
                 result, status = {"error": "not found"}, 404
         except SystemExit as exc:
             # The underlying scripts raise SystemExit for validation errors.
             result, status = {"error": str(exc)}, 400
         except Exception as exc:
-            LOG.exception("review api error path=%s", self.path)
+            LOG.exception("review api error path=%s", path)
             result, status = {"error": str(exc)}, 500
 
         _send_json(self, result, status)

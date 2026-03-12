@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import time
 import unicodedata
@@ -33,14 +34,6 @@ from urllib.parse import urlparse
 import requests
 from bs4 import BeautifulSoup, NavigableString, Tag
 from newsletter_revh_parser import ParsedArticle, parse_email_articles, unwrap as revh_unwrap
-
-try:
-    import docker
-    from docker.errors import DockerException, NotFound
-except Exception:  # pragma: no cover - handled at runtime in container
-    docker = None
-    DockerException = Exception
-    NotFound = Exception
 
 
 LOG = logging.getLogger("process_newsletter")
@@ -206,7 +199,6 @@ IMAGE_PROBE_CACHE: dict[str, dict[str, Any]] = {}
 SOURCE_TEXT_CACHE: dict[str, str] = {}
 SOURCE_SNAPSHOT_CACHE: dict[str, dict[str, Any]] = {}
 WEB_IMAGE_SEARCH_CACHE: dict[str, dict[str, Any]] = {}
-_DOCKER_CLIENT: Any | None = None
 ANCHOR_NOISE_TEXT_RE = re.compile(
     r"(?:\bread online\b|\bview in browser\b|\bsign ?up\b|\bsubscribe\b|\badvertise\b|"
     r"\bpartner with us\b|\bget started\b|\bupdate your email preferences\b|"
@@ -399,7 +391,9 @@ class Config:
     portal_api_url: str = os.getenv("PORTAL_API_URL", "http://portal:8000/api/agent")
     agent_api_key: str = os.getenv("AGENT_API_KEY", "")
     llm_backend: str = os.getenv("LLM_BACKEND", "ollama").strip().lower()
-    openclaw_container_name: str = os.getenv("OPENCLAW_CONTAINER_NAME", "plutonia-openclaw")
+    openclaw_gateway_url: str = os.getenv("OPENCLAW_GATEWAY_URL", "").strip()
+    openclaw_gateway_token: str = os.getenv("OPENCLAW_GATEWAY_TOKEN", "").strip()
+    openclaw_gateway_password: str = os.getenv("OPENCLAW_GATEWAY_PASSWORD", "").strip()
     openclaw_timeout_seconds: int = int(os.getenv("OPENCLAW_TIMEOUT_SECONDS", "180"))
     openclaw_session_prefix: str = os.getenv("OPENCLAW_SESSION_PREFIX", "agent:main:newsletter")
     openclaw_fallback_ollama: bool = os.getenv("OPENCLAW_FALLBACK_OLLAMA", "false").strip().lower() in BOOL_TRUE
@@ -3465,9 +3459,11 @@ def _assert_required_summary_model(cfg: Config) -> None:
 
 
 def _openclaw_gateway_call(cfg: Config, method: str, params: dict[str, Any], timeout_ms: int = 120000) -> dict[str, Any]:
-    global _DOCKER_CLIENT
+    cli = shutil.which("openclaw")
+    if not cli:
+        raise RuntimeError("openclaw CLI not installed in this container")
     cmd = [
-        "openclaw",
+        cli,
         "gateway",
         "call",
         method,
@@ -3478,40 +3474,39 @@ def _openclaw_gateway_call(cfg: Config, method: str, params: dict[str, Any], tim
         json.dumps(params, ensure_ascii=False),
     ]
 
-    if docker is None:
-        raise RuntimeError("docker SDK not available in container")
+    gateway_url = str(cfg.openclaw_gateway_url or "").strip()
+    if gateway_url:
+        cmd.extend(["--url", gateway_url])
+        gateway_token = str(cfg.openclaw_gateway_token or "").strip()
+        gateway_password = str(cfg.openclaw_gateway_password or "").strip()
+        if gateway_token:
+            cmd.extend(["--token", gateway_token])
+        elif gateway_password:
+            cmd.extend(["--password", gateway_password])
+        else:
+            raise RuntimeError(
+                "OPENCLAW_GATEWAY_URL requires OPENCLAW_GATEWAY_TOKEN or OPENCLAW_GATEWAY_PASSWORD; "
+                "docker socket execution is no longer supported"
+            )
 
     try:
-        if _DOCKER_CLIENT is None:
-            _DOCKER_CLIENT = docker.from_env()
-        container = _DOCKER_CLIENT.containers.get(cfg.openclaw_container_name)
-        exec_result = container.exec_run(
+        exec_result = subprocess.run(
             cmd,
-            stdout=True,
-            stderr=True,
-            demux=False,
-            tty=False,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=max(10, int(timeout_ms / 1000) + 10),
         )
-    except NotFound as exc:
-        raise RuntimeError(f"openclaw container not found: {cfg.openclaw_container_name}") from exc
-    except DockerException as exc:
-        raise RuntimeError(f"openclaw docker call failed: {exc}") from exc
     except Exception as exc:
         raise RuntimeError(f"openclaw command failed: {exc}") from exc
 
-    if isinstance(exec_result, tuple):
-        exit_code, raw_output = exec_result
-    else:
-        exit_code = int(getattr(exec_result, "exit_code", 1))
-        raw_output = getattr(exec_result, "output", b"")
-
-    if isinstance(raw_output, bytes):
-        output = raw_output.decode("utf-8", errors="replace").strip()
-    else:
-        output = str(raw_output or "").strip()
+    exit_code = int(getattr(exec_result, "returncode", 1))
+    stdout = str(exec_result.stdout or "").strip()
+    stderr = str(exec_result.stderr or "").strip()
+    output = stdout or stderr
 
     if exit_code != 0:
-        err = output
+        err = output or stderr or stdout
         raise RuntimeError(f"openclaw gateway call failed ({method}): {err}")
 
     if not output:

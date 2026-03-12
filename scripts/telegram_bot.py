@@ -19,8 +19,8 @@ import logging
 import os
 import re
 import threading
-import unicodedata
 import time
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +39,7 @@ from process_newsletter import (
     _assert_required_summary_model,
     _get_source_snapshot,
     _llm_generate,
+    _openclaw_generate,
     _normalize_article_body_text,
     _normalize_keywords,
     _normalize_summary_text,
@@ -55,7 +56,6 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 PORTAL_PUBLIC_BASE_URL = os.getenv("PORTAL_PUBLIC_BASE_URL", "").rstrip("/")
 TELEGRAM_TRIAGE_INTERVAL = int(os.getenv("TELEGRAM_TRIAGE_INTERVAL", "15"))
 TELEGRAM_TRIAGE_NEWSLETTER_ID = os.getenv("TELEGRAM_TRIAGE_NEWSLETTER_ID", "").strip()
-CLOUDFLARED_CONTAINER_NAME = os.getenv("CLOUDFLARED_CONTAINER_NAME", "ainews-cloudflared").strip()
 REVIEW_OUTPUT_DIR = os.getenv("REVIEW_OUTPUT_DIR", "/review").strip() or "/review"
 WATCHDOG_STATUS_FILE = os.getenv("WATCHDOG_STATUS_FILE", "/review/ops_watchdog_status.json").strip() or "/review/ops_watchdog_status.json"
 
@@ -63,7 +63,6 @@ WATCHDOG_STATUS_FILE = os.getenv("WATCHDOG_STATUS_FILE", "/review/ops_watchdog_s
 OLLAMA_MODEL_TITLE = os.getenv("OLLAMA_MODEL_TITLE", "").strip()
 OLLAMA_MODEL_LINK_VALIDATION = os.getenv("OLLAMA_MODEL_LINK_VALIDATION", "").strip()
 _PUBLIC_BASE_CACHE: str | None = None
-_TRYCLOUDFLARE_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com", re.IGNORECASE)
 
 
 def _esc(text: str) -> str:
@@ -77,23 +76,6 @@ def _resolve_public_base_url() -> str:
     if PORTAL_PUBLIC_BASE_URL:
         _PUBLIC_BASE_CACHE = PORTAL_PUBLIC_BASE_URL
         return _PUBLIC_BASE_CACHE
-
-    for attempt in range(1, 6):
-        try:
-            import docker
-
-            client = docker.from_env()
-            container = client.containers.get(CLOUDFLARED_CONTAINER_NAME)
-            logs = container.logs(tail=500).decode("utf-8", errors="replace")
-            matches = _TRYCLOUDFLARE_RE.findall(logs)
-            if matches:
-                _PUBLIC_BASE_CACHE = matches[-1].rstrip("/")
-                return _PUBLIC_BASE_CACHE
-        except Exception as exc:
-            LOG.warning("failed to resolve public base url from cloudflared logs: %s", exc)
-            break
-        if attempt < 5:
-            time.sleep(1)
     return ""
 
 
@@ -342,6 +324,60 @@ def _build_status_reply(cfg: Config) -> str:
     if payload is None:
         payload = _live_pipeline_status(cfg)
     return _format_pipeline_status_message(payload)
+
+
+def _openclaw_frontend_prompt(user_text: str) -> str:
+    text = str(user_text or "").strip()
+    return (
+        "You are responding behind the unified Telegram frontend for @plutonai_news_bot.\n"
+        "Reply in the same language as the user's message.\n"
+        "Do not tell the user to contact another bot.\n"
+        "The inline editorial triage buttons are handled by the frontend; do not ask the user to switch bots.\n"
+        "If the user asks about the current editorial item, inspect the internal APIs and answer directly.\n"
+        "Be concise.\n\n"
+        f"Latest Telegram message:\n{text}"
+    )
+
+
+def _query_openclaw_frontend(cfg: Config, user_text: str) -> str:
+    original_backend = cfg.llm_backend
+    original_timeout = cfg.openclaw_timeout_seconds
+    try:
+        cfg.llm_backend = "openclaw"
+        cfg.openclaw_timeout_seconds = max(45, min(int(original_timeout or 180), 180))
+        return _openclaw_generate(cfg, _openclaw_frontend_prompt(user_text)).strip()
+    finally:
+        cfg.llm_backend = original_backend
+        cfg.openclaw_timeout_seconds = original_timeout
+
+
+def _recover_pending_input_from_editorial_state(cfg: Config) -> dict[str, Any] | None:
+    try:
+        payload = _api_get(cfg, "articles/editorial-pending/", {"mode": "oldest", "exclude_tg_triaged": "true"})
+    except Exception as exc:
+        LOG.warning("failed to recover pending input context err=%s", exc)
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+    if str(payload.get("reason", "")).strip() != "active_triage_exists":
+        return None
+
+    article = payload.get("article")
+    if not isinstance(article, dict):
+        return None
+
+    try:
+        article_id = int(article.get("id") or 0)
+    except Exception:
+        article_id = 0
+    if article_id <= 0:
+        return None
+
+    tg_status = str(article.get("telegram_triage_status", "")).strip().lower()
+    if tg_status == "waiting_edit":
+        return {"article_id": article_id, "action": "requestchanges", "recovered": True}
+    return None
 
 
 
@@ -1350,20 +1386,24 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     cfg = _get_cfg()
-    if _looks_like_status_query(user_text):
-        try:
-            await update.message.reply_text(
-                _build_status_reply(cfg),
-                disable_web_page_preview=True,
-            )
-        except Exception as exc:
-            await update.message.reply_text(f"Erro ao obter estado do pipeline: {exc}")
-        return
-
     pending = _pop_pending_input(chat_id) if chat_id else None
     if not pending:
-        return
+        pending = _recover_pending_input_from_editorial_state(cfg)
+    if not pending:
+        try:
+            loop = asyncio.get_running_loop()
+            reply_text = await loop.run_in_executor(None, _query_openclaw_frontend, cfg, user_text)
+        except Exception as e:
+            LOG.warning("OpenClaw frontend request failed: %s", e)
+            await update.message.reply_text(
+                "Nao consegui obter resposta do OpenClaw neste momento. Tenta novamente.",
+                disable_web_page_preview=True,
+            )
+            return
 
+        if reply_text:
+            await update.message.reply_text(reply_text, disable_web_page_preview=True)
+        return
 
     article_id = pending["article_id"]
     action = pending["action"]

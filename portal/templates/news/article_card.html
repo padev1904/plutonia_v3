@@ -1,15 +1,44 @@
-<article class="feed-item border-b border-slate-200 py-4 last:border-b-0">
-  <div class="flex items-start justify-between gap-3">
-    <div class="min-w-0">
-      <p class="feed-meta text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">
-        <span>{{ article.published_at|date:"M d"|upper }}</span>
-        <span aria-hidden="true" class="mx-1.5 text-slate-400">·</span>
-        <span>{{ article.section|default:article.source_name }}</span>
-      </p>
-      <h2 class="mt-2 text-xl font-medium leading-snug text-slate-900 sm:text-2xl">
-        <a href="{% url 'news:article-detail' article.id %}" class="feed-title hover:text-blue-700">{{ article.title }}</a>
-      </h2>
-    </div>
-    <div id="favorite-{{ article.id }}" class="shrink-0">{% include "news/partials/favorite_button.html" %}</div>
+<a href="{% url 'news:article-detail' article.id %}" class="group flex h-full flex-col overflow-hidden rounded-3xl border border-slate-200 bg-white shadow-sm transition hover:-translate-y-0.5 hover:border-blue-300 hover:shadow-lg">
+  {% if article.image_url %}
+  <div class="aspect-[16/9] overflow-hidden bg-slate-100">
+    <img src="{{ article.image_url }}" alt="{{ article.title }}" loading="lazy" class="h-full w-full object-cover transition duration-300 group-hover:scale-[1.02]" referrerpolicy="no-referrer" />
   </div>
-</article>
+  {% else %}
+  <div class="flex aspect-[16/9] items-end overflow-hidden bg-[radial-gradient(circle_at_top_left,_rgba(37,99,235,0.22),_transparent_48%),linear-gradient(135deg,_#0f172a,_#1e293b_55%,_#334155)] p-5 text-white">
+    <div class="w-full">
+      <p class="inline-flex rounded-full border border-white/15 bg-white/10 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.18em] text-white/80">
+        {{ article.section|default:article.source_name|default:"Editorial Preview" }}
+      </p>
+      <p class="mt-3 max-w-xs text-lg font-semibold leading-snug text-white">
+        {{ article.title|truncatechars:72 }}
+      </p>
+    </div>
+  </div>
+  {% endif %}
+
+  <div class="flex flex-1 flex-col gap-4 p-5">
+    <div class="flex items-center justify-between gap-3 text-xs font-semibold uppercase tracking-[0.14em] text-slate-500">
+      <span>{{ article.original_publication_date|date:"M d, Y" }}</span>
+      <span class="rounded-full bg-slate-100 px-2.5 py-1 text-[11px] text-slate-700">Score {{ article.equivalent_score|default:1 }}</span>
+    </div>
+
+    <div>
+      <h2 class="text-xl font-semibold leading-snug text-slate-900 transition group-hover:text-blue-700">{{ article.title }}</h2>
+      {% if article.summary %}
+      <p class="mt-3 text-sm leading-6 text-slate-600">{{ article.summary }}</p>
+      {% endif %}
+    </div>
+
+    <div class="mt-auto flex flex-wrap gap-2 text-xs font-medium">
+      {% if article.section %}
+      <span class="rounded-full bg-blue-50 px-2.5 py-1 text-blue-700">{{ article.section }}</span>
+      {% endif %}
+      {% if article.category %}
+      <span class="rounded-full bg-emerald-50 px-2.5 py-1 text-emerald-700">{{ article.category }}</span>
+      {% endif %}
+      {% if article.subcategory %}
+      <span class="rounded-full bg-orange-50 px-2.5 py-1 text-orange-700">{{ article.subcategory }}</span>
+      {% endif %}
+    </div>
+  </div>
+</a>

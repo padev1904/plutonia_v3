@@ -7,14 +7,36 @@ repo_depth="${OPENCLAW_BOOTSTRAP_REPO_DEPTH:-1}"
 repo_auto_update="${OPENCLAW_BOOTSTRAP_REPO_AUTO_UPDATE:-false}"
 workspace_dir="${OPENCLAW_AGENT_WORKSPACE:-${OPENCLAW_WORKSPACE_DIR:-/root/.openclaw/workspace}}"
 repo_dir="${OPENCLAW_BOOTSTRAP_REPO_DIR:-$workspace_dir/repo}"
+repo_push_url="${OPENCLAW_GIT_PUSH_URL:-}"
+github_push_token="${OPENCLAW_GITHUB_PUSH_TOKEN:-}"
+github_push_username="${OPENCLAW_GITHUB_PUSH_USERNAME:-x-access-token}"
 
 if [ -z "$repo_url" ]; then
   exit 0
 fi
 
+case "$repo_push_url" in
+  "")
+    case "$repo_url" in
+      https://github.com/*)
+        if [ -n "$github_push_token" ]; then
+          repo_push_url="$(printf '%s' "$repo_url" | sed "s#^https://github.com/#https://${github_push_username}:${github_push_token}@github.com/#")"
+        fi
+        ;;
+    esac
+    ;;
+esac
+
 mkdir -p "$workspace_dir"
 mkdir -p "$(dirname "$repo_dir")"
 git config --global --add safe.directory "$repo_dir" || true
+
+sync_remote_urls() {
+  git -C "$repo_dir" remote set-url origin "$repo_url" || true
+  if [ -n "$repo_push_url" ]; then
+    git -C "$repo_dir" remote set-url --push origin "$repo_push_url" || true
+  fi
+}
 
 depth_args=""
 case "$(printf '%s' "$repo_depth" | tr -d '[:space:]')" in
@@ -23,6 +45,7 @@ case "$(printf '%s' "$repo_depth" | tr -d '[:space:]')" in
 esac
 
 if [ -d "$repo_dir/.git" ]; then
+  sync_remote_urls
   case "$(printf '%s' "$repo_auto_update" | tr '[:upper:]' '[:lower:]')" in
     1|true|yes|on) ;;
     *) exit 0 ;;
@@ -31,7 +54,6 @@ if [ -d "$repo_dir/.git" ]; then
     echo "openclaw workspace repo is dirty; skipping auto-update: $repo_dir" >&2
     exit 0
   fi
-  git -C "$repo_dir" remote set-url origin "$repo_url" || true
   if [ -n "$depth_args" ]; then
     git -C "$repo_dir" fetch $depth_args origin "$repo_branch"
   else
@@ -60,3 +82,4 @@ if [ -n "$depth_args" ]; then
 else
   git clone --branch "$repo_branch" "$repo_url" "$repo_dir"
 fi
+sync_remote_urls

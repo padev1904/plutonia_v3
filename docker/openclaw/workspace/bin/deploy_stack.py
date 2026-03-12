@@ -22,7 +22,17 @@ REPO_DIR = _resolve_repo_dir()
 OPS_RUNNER_BASE_URL = os.getenv("OPS_RUNNER_BASE_URL", "http://ops-runner:8011").rstrip("/")
 
 
+def _ensure_safe_directory() -> None:
+    subprocess.run(
+        ["git", "config", "--global", "--add", "safe.directory", str(REPO_DIR)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
 def _git(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    _ensure_safe_directory()
     result = subprocess.run(
         ["git", *args],
         cwd=str(REPO_DIR),

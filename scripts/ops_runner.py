@@ -264,6 +264,9 @@ class Handler(BaseHTTPRequestHandler):
         return parsed if isinstance(parsed, dict) else {}
 
     def _auth_failed(self) -> bool:
+        parsed = urlparse(self.path)
+        if parsed.path == "/healthz":
+            return False
         if not TOKEN:
             return False
         provided = self.headers.get("X-Ops-Runner-Token", "").strip()

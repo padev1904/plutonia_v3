@@ -14,6 +14,7 @@ fi
 
 mkdir -p "$workspace_dir"
 mkdir -p "$(dirname "$repo_dir")"
+git config --global --add safe.directory "$repo_dir" || true
 
 depth_args=""
 case "$(printf '%s' "$repo_depth" | tr -d '[:space:]')" in

@@ -31,7 +31,17 @@ DEFAULT_PUSH_TOKEN = (
 DEFAULT_PUSH_USERNAME = os.getenv("OPENCLAW_GITHUB_PUSH_USERNAME", "x-access-token").strip() or "x-access-token"
 
 
+def _ensure_safe_directory() -> None:
+    subprocess.run(
+        ["git", "config", "--global", "--add", "safe.directory", str(REPO_DIR)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
 def _git(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    _ensure_safe_directory()
     result = subprocess.run(
         ["git", *args],
         cwd=str(REPO_DIR),

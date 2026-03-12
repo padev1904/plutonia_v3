@@ -44,9 +44,13 @@ Safe runtime actions currently available:
 
 Mandatory promotion flow for production changes:
 1. Edit code under `/workspace/repo`.
-2. Run the relevant validation commands locally in the workspace.
-3. Prefer `promote_stack.py` for commit/push/deploy in one step.
-4. If you split the flow manually, commit and push with `repo_commit_push.py`.
-5. Deploy with `deploy_stack.py`.
-6. Confirm live status with `repo_status.py` and health endpoints.
-7. If health degrades, roll back with `rollback_stack.py`.
+2. Before editing broadly, map the requested behavior to the exact files that must change.
+3. Implement one vertical slice at a time. Avoid leaving placeholder templates/routes/buttons without the matching backend behavior.
+4. Run the relevant validation commands locally in the workspace after each substantive edit batch.
+5. Inspect the exact diff for the touched files before expanding scope.
+6. If a touched file is inconsistent or fails validation twice, repair that file before editing other files.
+7. Prefer `promote_stack.py` for commit/push/deploy in one step.
+8. If you split the flow manually, commit and push with `repo_commit_push.py`.
+9. Deploy with `deploy_stack.py`.
+10. Confirm live status with `repo_status.py` and health endpoints.
+11. If health degrades, roll back with `rollback_stack.py`.

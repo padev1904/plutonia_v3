@@ -344,7 +344,8 @@ def _query_openclaw_frontend(cfg: Config, user_text: str) -> str:
     original_timeout = cfg.openclaw_timeout_seconds
     try:
         cfg.llm_backend = "openclaw"
-        cfg.openclaw_timeout_seconds = max(45, min(int(original_timeout or 180), 180))
+        frontend_timeout = int(os.getenv("OPENCLAW_FRONTEND_TIMEOUT_SECONDS", "600") or "600")
+        cfg.openclaw_timeout_seconds = max(45, min(max(int(original_timeout or 180), frontend_timeout), 1800))
         return _openclaw_generate(cfg, _openclaw_frontend_prompt(user_text)).strip()
     finally:
         cfg.llm_backend = original_backend

@@ -19,10 +19,13 @@ Use this skill when the user asks you to inspect, monitor, or unblock the Pluton
 4. If runtime action is needed, prefer the ops action endpoint over ad-hoc process intervention.
 5. Use shell, git, Python, ripgrep, HTTP fetch, and Docker-internal services freely inside the container when they help.
 6. Only edit code under `./repo` when the user is asking for a code or config change.
-7. For production code changes, follow this order strictly:
+7. For multi-file changes, map the requested behavior to the exact files first. Then complete one vertical slice at a time instead of scattering placeholder changes across the repo.
+8. After each substantive edit batch, inspect the diff for the touched files and run targeted validation before expanding scope.
+9. If a touched file becomes inconsistent or fails validation twice, stop broadening the change. Repair that file first.
+10. For production code changes, follow this order strictly:
    `edit -> validate -> promote_stack.py -> verify`.
    Use `repo_commit_push.py` plus `deploy_stack.py` separately only when you intentionally need the split flow.
-8. Keep responses concise and include what changed or what remains blocked.
+11. Keep responses concise and include what changed or what remains blocked.
 
 ## Editorial shortcuts
 - `python3 /workspace/bin/editorial_action.py prepare_preview_process --article-id <id>`

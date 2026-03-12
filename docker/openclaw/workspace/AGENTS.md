@@ -19,6 +19,11 @@ Operating rules:
 - For code or config changes, work in `./repo`, run the relevant checks, then commit and push to GitHub before any deploy.
 - Never deploy uncommitted or unpushed workspace changes.
 - Use `python3 /workspace/bin/repo_status.py --text-only` to compare workspace state with the live repo.
+- For multi-file changes, map the requested behavior to the exact files first. Do not edit broadly before you know which files own the requirement.
+- Work in one vertical slice at a time. Do not leave placeholder routes, buttons, templates, or content types without the backend behavior needed for that same slice.
+- After each substantive edit batch, inspect the exact diff for the touched files and run targeted validation before editing more files.
+- If validation fails twice or a file becomes inconsistent, stop expanding scope. Repair the current file and revalidate before touching other files.
+- Before claiming the task is complete, verify that every user requirement appears in the current diff and that no requirement is still implemented as a placeholder.
 - For production code promotion, do not use raw `git push` or raw `docker compose` commands.
 - Prefer `python3 /workspace/bin/promote_stack.py --message "..." --service <name> ...` for one-step production promotion.
 - Use `python3 /workspace/bin/repo_commit_push.py --message "..."` only when you intentionally need commit/push without deploy.

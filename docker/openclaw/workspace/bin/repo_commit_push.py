@@ -160,8 +160,21 @@ def main() -> int:
         branch = _current_branch()
         remote_url = _git("remote", "get-url", DEFAULT_REMOTE).stdout.strip()
         _set_identity(DEFAULT_AUTHOR_NAME, DEFAULT_AUTHOR_EMAIL)
+        status_before = _repo_status()
         _stage_changes(args.path)
-        commit_head = _commit(args.message.strip(), args.allow_empty)
+        dirty_after_stage = bool(_git("status", "--porcelain", check=False).stdout.strip())
+        push_mode = "commit_and_push"
+        if dirty_after_stage:
+            commit_head = _commit(args.message.strip(), args.allow_empty)
+        elif not status_before.get("head_pushed"):
+            commit_head = str(status_before.get("head") or "").strip()
+            if not commit_head:
+                raise RuntimeError("repository has no local HEAD to push")
+            push_mode = "push_existing_head"
+        elif args.allow_empty:
+            commit_head = _commit(args.message.strip(), args.allow_empty)
+        else:
+            raise RuntimeError("working tree has no staged or unstaged changes and HEAD is already pushed")
         push_target = _push_target(DEFAULT_REMOTE, remote_url, DEFAULT_PUSH_USERNAME, DEFAULT_PUSH_TOKEN)
         _git("push", push_target, f"HEAD:{branch}")
         remote_branch_head = _remote_branch_head(DEFAULT_REMOTE, branch)
@@ -176,10 +189,14 @@ def main() -> int:
             "remote": DEFAULT_REMOTE,
             "remote_url": remote_url,
             "head_pushed": True,
+            "mode": push_mode,
             "repo": _repo_status(),
         }
         if args.text_only:
-            print(f"Committed and pushed {commit_head} to {DEFAULT_REMOTE}/{branch}")
+            if push_mode == "push_existing_head":
+                print(f"Pushed existing HEAD {commit_head} to {DEFAULT_REMOTE}/{branch}")
+            else:
+                print(f"Committed and pushed {commit_head} to {DEFAULT_REMOTE}/{branch}")
         else:
             print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0

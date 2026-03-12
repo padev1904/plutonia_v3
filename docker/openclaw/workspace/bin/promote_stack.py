@@ -70,6 +70,15 @@ def _wait_for_health(urls: list[str], timeout: int, interval: int) -> list[dict]
     return last_results
 
 
+def _rollback(services: list[str], rollback_ref: str, no_build: bool) -> dict:
+    rollback_cmd = ["--ref", rollback_ref, "--reason", "automatic rollback after failed promotion"]
+    if no_build:
+        rollback_cmd.append("--no-build")
+    for service in services:
+        rollback_cmd.extend(["--service", service])
+    return _run_json("rollback_stack.py", *rollback_cmd)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Commit, push, deploy, and verify a production change")
     parser.add_argument("--message", required=True, help="Commit message")
@@ -105,7 +114,16 @@ def main() -> int:
             deploy_cmd.append("--no-build")
         for service in services:
             deploy_cmd.extend(["--service", service])
-        deploy_result = _run_json("deploy_stack.py", *deploy_cmd)
+        rollback_result = None
+        try:
+            deploy_result = _run_json("deploy_stack.py", *deploy_cmd)
+        except Exception as exc:
+            if rollback_ref:
+                try:
+                    rollback_result = _rollback(services, rollback_ref, args.no_build)
+                except Exception as rollback_exc:
+                    raise RuntimeError(f"deploy failed: {exc}; rollback failed: {rollback_exc}") from rollback_exc
+            raise RuntimeError(f"deploy failed: {exc}; rollback={'ok' if rollback_result else 'not-run'}") from exc
 
         health_results = _wait_for_health(
             [url.strip() for url in args.health_url if url.strip()],
@@ -113,14 +131,8 @@ def main() -> int:
             interval=args.health_interval,
         )
         health_ok = all(item.get("status") == "ok" for item in health_results) if health_results else True
-        rollback_result = None
         if not health_ok and rollback_ref:
-            rollback_cmd = ["--ref", rollback_ref, "--reason", "automatic rollback after failed health check"]
-            if args.no_build:
-                rollback_cmd.append("--no-build")
-            for service in services:
-                rollback_cmd.extend(["--service", service])
-            rollback_result = _run_json("rollback_stack.py", *rollback_cmd)
+            rollback_result = _rollback(services, rollback_ref, args.no_build)
 
         payload = {
             "status": "ok" if health_ok else "degraded",

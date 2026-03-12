@@ -20,6 +20,8 @@ def _resolve_repo_dir() -> Path:
 
 REPO_DIR = _resolve_repo_dir()
 OPS_RUNNER_BASE_URL = os.getenv("OPS_RUNNER_BASE_URL", "http://ops-runner:8011").rstrip("/")
+DEFAULT_REMOTE = os.getenv("OPENCLAW_GIT_PUSH_REMOTE", "origin").strip() or "origin"
+DEFAULT_BRANCH = os.getenv("OPENCLAW_GIT_PUSH_BRANCH", "").strip()
 
 
 def _ensure_safe_directory() -> None:
@@ -51,21 +53,37 @@ def _repo_status() -> dict:
     branch = _git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
     upstream_ref = ""
     upstream_head = ""
+    remote_branch = DEFAULT_BRANCH or (branch if branch != "HEAD" else "")
+    remote_branch_head = ""
     head_pushed = False
     try:
         upstream_ref = _git("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}").stdout.strip()
         upstream_head = _git("rev-parse", "@{u}").stdout.strip()
-        head_pushed = bool(head and upstream_head and head == upstream_head)
     except Exception:
         pass
+    if remote_branch:
+        remote_branch_head = _remote_branch_head(DEFAULT_REMOTE, remote_branch)
+    if remote_branch_head:
+        head_pushed = bool(head and head == remote_branch_head)
+    elif upstream_head:
+        head_pushed = bool(head and upstream_head and head == upstream_head)
     return {
         "branch": branch,
         "head": head,
         "dirty": dirty,
         "upstream_ref": upstream_ref,
         "upstream_head": upstream_head,
+        "remote_branch_head": remote_branch_head,
         "head_pushed": head_pushed,
     }
+
+
+def _remote_branch_head(remote_name: str, branch: str) -> str:
+    result = _git("ls-remote", remote_name, f"refs/heads/{branch}", check=False)
+    if result.returncode != 0:
+        return ""
+    parts = result.stdout.strip().split()
+    return parts[0] if parts else ""
 
 
 def _headers() -> dict[str, str]:

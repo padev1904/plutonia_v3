@@ -103,15 +103,20 @@ def _repo_status() -> dict[str, Any]:
     remote = _git("remote", "get-url", "origin", check=False).stdout.strip()
     upstream_ref = ""
     upstream_head = ""
+    remote_branch_head = ""
     in_sync = False
     try:
         upstream_ref = _git("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}").stdout.strip()
         upstream_head = _git("rev-parse", "@{u}").stdout.strip()
-        in_sync = bool(head and upstream_head and head == upstream_head)
     except Exception:
         upstream_ref = ""
         upstream_head = ""
-        in_sync = False
+    if branch and branch != "HEAD":
+        remote_branch_head = _remote_branch_head(branch)
+    if remote_branch_head:
+        in_sync = bool(head and head == remote_branch_head)
+    elif upstream_head:
+        in_sync = bool(head and head == upstream_head)
     return {
         "repo_dir": str(REPO_DIR),
         "compose_file": str(COMPOSE_FILE),
@@ -121,6 +126,7 @@ def _repo_status() -> dict[str, Any]:
         "remote": remote,
         "upstream_ref": upstream_ref,
         "upstream_head": upstream_head,
+        "remote_branch_head": remote_branch_head,
         "head_pushed": in_sync,
     }
 
@@ -174,21 +180,40 @@ def _git_fetch() -> None:
     _git("fetch", "--tags", "--prune", "origin")
 
 
+def _remote_branch_head(branch: str) -> str:
+    result = _git("ls-remote", "origin", f"refs/heads/{branch}", check=False)
+    if result.returncode != 0:
+        return ""
+    parts = result.stdout.strip().split()
+    return parts[0] if parts else ""
+
+
+def _ensure_ref_exists(ref: str) -> str:
+    target = str(ref or "").strip()
+    if not target:
+        raise RuntimeError("ref is required")
+    resolved = _git("rev-parse", "--verify", target).stdout.strip()
+    if not resolved:
+        raise RuntimeError(f"unable to resolve ref: {target}")
+    return resolved
+
+
 def _checkout_ref(ref: str) -> None:
     target = str(ref or "").strip()
     if not target:
         return
     _git_fetch()
+    resolved = _ensure_ref_exists(target)
     _git("checkout", "--force", LIVE_BRANCH)
-    _git("reset", "--hard", target)
+    _git("reset", "--hard", resolved)
     _git("clean", "-fd")
 
 
-def _require_clean_and_pushed() -> dict[str, Any]:
+def _require_clean_and_pushed(*, require_upstream_head: bool = True) -> dict[str, Any]:
     status = _repo_status()
     if status["dirty"]:
         raise ConflictError("live repo is dirty; refusing deploy")
-    if REQUIRE_PUSHED_HEAD and not status["head_pushed"]:
+    if REQUIRE_PUSHED_HEAD and require_upstream_head and not status["head_pushed"]:
         raise ConflictError("live repo HEAD is not synchronized with upstream; refusing deploy")
     return status
 
@@ -203,7 +228,12 @@ def _handle_status() -> tuple[dict[str, Any], int]:
     return payload, 200
 
 
-def _handle_deploy(data: dict[str, Any], *, action: str = "deploy") -> tuple[dict[str, Any], int]:
+def _handle_deploy(
+    data: dict[str, Any],
+    *,
+    action: str = "deploy",
+    require_upstream_head: bool = True,
+) -> tuple[dict[str, Any], int]:
     services = _validate_services(data.get("services"))
     ref = str(data.get("ref", "")).strip()
     build = bool(data.get("build", True))
@@ -212,7 +242,7 @@ def _handle_deploy(data: dict[str, Any], *, action: str = "deploy") -> tuple[dic
     before = _repo_status()
     if ref:
         _checkout_ref(ref)
-    after_checkout = _require_clean_and_pushed()
+    after_checkout = _require_clean_and_pushed(require_upstream_head=require_upstream_head)
     _compose("config", "--quiet", timeout=120)
     compose_args = ["up", "-d"]
     if build:
@@ -248,6 +278,7 @@ def _handle_rollback(data: dict[str, Any]) -> tuple[dict[str, Any], int]:
             "reason": reason,
         },
         action="rollback",
+        require_upstream_head=False,
     )
     return result, status
 

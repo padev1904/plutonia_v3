@@ -70,13 +70,20 @@ def _repo_status() -> dict:
     remote = _git("remote", "get-url", DEFAULT_REMOTE, check=False).stdout.strip()
     upstream_ref = ""
     upstream_head = ""
+    remote_branch = DEFAULT_BRANCH or (branch if branch != "HEAD" else "")
+    remote_branch_head = ""
     head_pushed = False
     try:
         upstream_ref = _git("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}").stdout.strip()
         upstream_head = _git("rev-parse", "@{u}").stdout.strip()
-        head_pushed = bool(head and upstream_head and head == upstream_head)
     except Exception:
         pass
+    if remote_branch:
+        remote_branch_head = _remote_branch_head(DEFAULT_REMOTE, remote_branch)
+    if remote_branch_head:
+        head_pushed = bool(head and head == remote_branch_head)
+    elif upstream_head:
+        head_pushed = bool(head and head == upstream_head)
     return {
         "repo_dir": str(REPO_DIR),
         "branch": branch,
@@ -85,6 +92,7 @@ def _repo_status() -> dict:
         "remote": remote,
         "upstream_ref": upstream_ref,
         "upstream_head": upstream_head,
+        "remote_branch_head": remote_branch_head,
         "head_pushed": head_pushed,
     }
 
@@ -112,6 +120,14 @@ def _push_target(remote_name: str, remote_url: str, username: str, token: str) -
         raise RuntimeError("token-based push requires an https GitHub remote or OPENCLAW_GIT_PUSH_URL")
     auth = f"{quote(username, safe='')}:{quote(token, safe='')}"
     return urlunparse((parsed.scheme, f"{auth}@{parsed.netloc}", parsed.path, parsed.params, parsed.query, parsed.fragment))
+
+
+def _remote_branch_head(remote_name: str, branch: str) -> str:
+    result = _git("ls-remote", remote_name, f"refs/heads/{branch}", check=False)
+    if result.returncode != 0:
+        return ""
+    parts = result.stdout.strip().split()
+    return parts[0] if parts else ""
 
 
 def _stage_changes(paths: list[str]) -> None:
@@ -148,6 +164,11 @@ def main() -> int:
         commit_head = _commit(args.message.strip(), args.allow_empty)
         push_target = _push_target(DEFAULT_REMOTE, remote_url, DEFAULT_PUSH_USERNAME, DEFAULT_PUSH_TOKEN)
         _git("push", push_target, f"HEAD:{branch}")
+        remote_branch_head = _remote_branch_head(DEFAULT_REMOTE, branch)
+        if remote_branch_head != commit_head:
+            raise RuntimeError(
+                f"push verification failed: remote {DEFAULT_REMOTE}/{branch} is {remote_branch_head or '<missing>'}, expected {commit_head}"
+            )
         payload = {
             "status": "ok",
             "branch": branch,

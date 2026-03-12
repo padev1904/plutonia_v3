@@ -3542,11 +3542,34 @@ def _extract_openclaw_assistant_text(message: dict[str, Any]) -> str:
     return ""
 
 
-def _openclaw_generate(cfg: Config, prompt: str) -> str:
+def _looks_like_openclaw_progress_text(text: str) -> bool:
+    normalized = " ".join(str(text or "").split()).strip().lower()
+    if not normalized:
+        return False
+    if normalized.startswith("{") and ("\"name\": \"exec\"" in normalized or "\"command\":" in normalized):
+        return True
+    progress_markers = (
+        "let me ",
+        "i need to ",
+        "i should ",
+        "the user is asking",
+        "from tools.md",
+        "looking at the internal endpoints",
+        "i should call",
+        "let me make that call",
+        "the deployment command is still running",
+        "the reviewer is still running",
+        "<|im_start|>user",
+    )
+    return normalized.startswith(progress_markers)
+
+
+def _openclaw_generate(cfg: Config, prompt: str, *, frontend_final_only: bool = False) -> str:
     session_key = f"{cfg.openclaw_session_prefix}:{uuid.uuid4().hex[:12]}"
     run_id = f"nl-{uuid.uuid4().hex[:16]}"
     timeout_ms = max(20000, cfg.openclaw_timeout_seconds * 1000)
     poll_deadline = time.time() + cfg.openclaw_timeout_seconds
+    last_progress_text = ""
 
     send_params = {
         "sessionKey": session_key,
@@ -3572,6 +3595,10 @@ def _openclaw_generate(cfg: Config, prompt: str) -> str:
                     continue
                 text = _extract_openclaw_assistant_text(msg)
                 if text:
+                    if frontend_final_only and _looks_like_openclaw_progress_text(text):
+                        last_progress_text = text
+                        LOG.debug("openclaw frontend ignoring progress-like assistant text: %s", text[:200])
+                        break
                     try:
                         _openclaw_gateway_call(
                             cfg,
@@ -3584,6 +3611,8 @@ def _openclaw_generate(cfg: Config, prompt: str) -> str:
                     return text
         time.sleep(1.25)
 
+    if frontend_final_only and last_progress_text:
+        raise RuntimeError("openclaw did not produce a final user-facing reply before timeout")
     raise RuntimeError("openclaw timeout waiting for assistant response")
 
 

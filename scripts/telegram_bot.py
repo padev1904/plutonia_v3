@@ -331,6 +331,10 @@ def _openclaw_frontend_prompt(user_text: str) -> str:
     return (
         "You are responding behind the unified Telegram frontend for @plutonai_news_bot.\n"
         "Reply in the same language as the user's message.\n"
+        "Reply only when you have the final answer or final action result.\n"
+        "Do not narrate internal reasoning, tool usage, or work-in-progress steps.\n"
+        "Do not say things like 'Let me check', 'I need to', 'I should', or similar planning text.\n"
+        "Do not mention TOOLS.md, curl, wrapper scripts, internal endpoints, sessions, or payloads.\n"
         "Do not tell the user to contact another bot.\n"
         "The inline editorial triage buttons are handled by the frontend; do not ask the user to switch bots.\n"
         "If the user asks about the current editorial item, inspect the internal APIs and answer directly.\n"
@@ -346,7 +350,7 @@ def _query_openclaw_frontend(cfg: Config, user_text: str) -> str:
         cfg.llm_backend = "openclaw"
         frontend_timeout = int(os.getenv("OPENCLAW_FRONTEND_TIMEOUT_SECONDS", "600") or "600")
         cfg.openclaw_timeout_seconds = max(45, min(max(int(original_timeout or 180), frontend_timeout), 1800))
-        return _openclaw_generate(cfg, _openclaw_frontend_prompt(user_text)).strip()
+        return _openclaw_generate(cfg, _openclaw_frontend_prompt(user_text), frontend_final_only=True).strip()
     finally:
         cfg.llm_backend = original_backend
         cfg.openclaw_timeout_seconds = original_timeout

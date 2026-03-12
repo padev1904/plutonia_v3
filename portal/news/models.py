@@ -183,7 +183,7 @@ class Article(models.Model):
     proposed_title = models.CharField(max_length=500, blank=True, default="")
     content_profile = models.CharField(
         max_length=24,
-        choices=[("news", "News"), ("resource", "Resource")],
+        choices=[("news", "News"), ("resource", "Resource"), ("product", "Product")],
         default="news",
     )
 

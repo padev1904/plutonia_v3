@@ -146,6 +146,25 @@ def article_detail(request: HttpRequest, pk: int) -> HttpResponse:
 
 
 @require_GET
+def product_detail(request: HttpRequest, pk: int) -> HttpResponse:
+    """View for product detail page"""
+    # Filter for approved products only
+    article = get_object_or_404(
+        Article.objects.filter(
+            is_review_approved=True,
+            editorial_status="approved",
+            content_profile="product",
+        ).select_related("newsletter").prefetch_related("categories"),
+        pk=pk
+    )
+    if not article.is_read:
+        article.is_read = True
+        article.save(update_fields=["is_read"])
+    back_url = request.META.get("HTTP_REFERER", "").strip() or "/"
+    return render(request, "news/article_detail.html", {"article": article, "back_url": back_url})
+
+
+@require_GET
 def article_preview(request: HttpRequest, token) -> HttpResponse:
     article = _editorial_queryset().filter(preview_token=token).order_by("-id").first()
     if article is None:
@@ -203,6 +222,42 @@ def article_card_public(request: HttpRequest, pk: int) -> HttpResponse:
             "article": article,
             "is_preview": False,
             "detail_preview_path": f"/article/{article.id}/",
+            "cards": cards,
+            "target_id": article.id,
+            "placeholder_range": range(placeholder_count),
+        },
+    )
+
+
+@require_GET
+def product_card_public(request: HttpRequest, pk: int) -> HttpResponse:
+    """Public card view for product articles"""
+    # Filter for approved products only
+    article = get_object_or_404(
+        Article.objects.filter(
+            is_review_approved=True,
+            editorial_status="approved",
+            content_profile="product",
+        ).select_related("newsletter").prefetch_related("categories"),
+        pk=pk
+    )
+    context_cards = list(
+        Article.objects.filter(
+            is_review_approved=True,
+            editorial_status="approved",
+            content_profile="product",
+        ).exclude(id=article.id).order_by("-published_at")[:5]
+    )
+    cards = [article, *context_cards]
+    placeholder_count = max(0, 6 - len(cards))
+
+    return render(
+        request,
+        "news/article_card_preview.html",
+        {
+            "article": article,
+            "is_preview": False,
+            "detail_preview_path": f"/products/{article.id}/",
             "cards": cards,
             "target_id": article.id,
             "placeholder_range": range(placeholder_count),
@@ -438,3 +493,46 @@ def resource_submit(request: HttpRequest) -> HttpResponse:
     return render(request, "news/resource_submit.html", context)
 
 
+<<<<<<< HEAD
+=======
+@require_GET
+def product_list(request: HttpRequest) -> HttpResponse:
+    """View for the Products section"""
+    # Filter articles by content_profile="product" and is_review_approved=True
+    qs = (
+        Article.objects.filter(
+            is_review_approved=True,
+            editorial_status="approved",
+            content_profile="product",
+        )
+        .select_related("newsletter")
+        .prefetch_related("categories")
+        .annotate(sort_published_at=Coalesce("newsletter__original_sent_at", "newsletter__received_at", "published_at"))
+        .order_by("-sort_published_at", "-id")
+    )
+    
+    query_text = request.GET.get("q", "").strip()
+
+    if query_text:
+        sq = SearchQuery(query_text)
+        qs = qs.annotate(rank=SearchRank("search_vector", sq)).filter(rank__gt=0.001).order_by("-rank", "-sort_published_at", "-id")
+
+    paginator = Paginator(qs, 24)
+    page_obj = paginator.get_page(request.GET.get("page", 1))
+
+    context = {
+        "page_obj": page_obj,
+        "filters": {
+            "q": query_text,
+        },
+        "page_heading": "Products",
+        "page_intro": "Our AI-powered products and SaaS offerings.",
+    }
+
+    if getattr(request, "htmx", False):
+        return render(request, "news/partials/article_cards.html", context)
+    
+    return render(request, "news/product_list.html", context)
+
+
+>>>>>>> b4ad623 (feat: Implement Products feature with Telegram destination labeling and public card views)

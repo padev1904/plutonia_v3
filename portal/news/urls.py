@@ -6,6 +6,9 @@ app_name = "news"
 
 urlpatterns = [
     path("", views.article_list, name="article-list"),
+    path("products/", views.product_list, name="product-list"),
+    path("products/<int:pk>/", views.product_detail, name="product-detail"),
+    path("products/<int:pk>/card/", views.product_card_public, name="product-card-public"),
     path("resources/", views.resource_list, name="resource-list"),
     path("resources/item/<int:pk>/", views.resource_detail, name="resource-detail"),
     path("resources/submit/", views.resource_submit, name="resource-submit"),

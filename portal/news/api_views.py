@@ -1122,7 +1122,7 @@ def update_article_link_validation(request):
 
     if "content_profile" in data:
         profile = str(data["content_profile"]).strip()
-        if profile in ("news", "resource"):
+        if profile in ("news", "resource", "product"):
             article.content_profile = profile
             update_fields.append("content_profile")
 

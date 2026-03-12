@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}Products - Plutonia AI Newsroom{% endblock %}
+{% block content %}
+<section class="mb-8 flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
+  <div>
+    <p class="mb-2 text-xs font-semibold uppercase tracking-[0.22em] text-blue-700">Products</p>
+    <h1 class="text-3xl font-bold text-slate-900 sm:text-4xl">Products</h1>
+    <p class="mt-2 max-w-3xl text-base text-slate-600">Our AI-powered products and SaaS offerings.</p>
+  </div>
+  <form method="get" class="w-full max-w-xl">
+    <input name="q" value="{{ filters.q }}" placeholder="Search products by title, summary, or source..." class="w-full rounded-2xl border border-slate-300 bg-white px-4 py-3 text-sm outline-none transition focus:border-blue-500 focus:ring-4 focus:ring-blue-100" />
+  </form>
+</section>
+
+<section>
+  <div id="article-list" class="grid gap-5 sm:grid-cols-2 xl:grid-cols-3">
+    {% include "news/partials/article_cards.html" %}
+  </div>
+
+  {% if page_obj.has_next %}
+  <div class="mt-8 text-center">
+    <button
+      class="rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 transition hover:border-blue-400 hover:text-blue-600"
+      hx-get="?page={{ page_obj.next_page_number }}&q={{ filters.q }}"
+      hx-target="#article-list"
+      hx-swap="beforeend"
+    >Load more</button>
+  </div>
+  {% endif %}
+</section>
+{% endblock %}

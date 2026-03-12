@@ -721,6 +721,14 @@ def _format_structured_preview(
     content_profile: str = "news",
 ) -> str:
     """Build second-step message with portal preview links."""
+    # Map content_profile to publication destination
+    if content_profile == "product":
+        publication_destination = "Products"
+    elif content_profile == "resource":
+        publication_destination = "Resources"
+    else:  # news
+        publication_destination = "News"
+        
     profile_label = "RECURSO" if content_profile == "resource" else "NOTICIA"
     section = _esc(str(article.get("section", "")))
     category = _esc(str(article.get("category", "")))
@@ -734,6 +742,7 @@ def _format_structured_preview(
         f"<b>Preview privado [{profile_label}]</b>",
         f"<b>{_esc(article.get('title', ''))}</b>",
         f"<b>{taxonomy}</b>",
+        f"<b>Destino de publicacao: {publication_destination}</b>",
         "",
     ]
 

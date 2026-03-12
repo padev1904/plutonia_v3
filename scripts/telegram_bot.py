@@ -338,6 +338,9 @@ def _openclaw_frontend_prompt(user_text: str) -> str:
         "Do not tell the user to contact another bot.\n"
         "The inline editorial triage buttons are handled by the frontend; do not ask the user to switch bots.\n"
         "If the user asks about the current editorial item, inspect the internal APIs and answer directly.\n"
+        "For runtime status or queue questions, use python3 /workspace/bin/ops_status.py --text-only first.\n"
+        "For editorial-session context, use python3 /workspace/bin/editorial_session.py --text first.\n"
+        "Do not use raw HTTP or curl for ops/editorial APIs when helper scripts exist.\n"
         "Be concise.\n\n"
         f"Latest Telegram message:\n{text}"
     )

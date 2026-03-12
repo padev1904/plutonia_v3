@@ -137,7 +137,21 @@ def article_list(request: HttpRequest) -> HttpResponse:
 
 @require_GET
 def article_detail(request: HttpRequest, pk: int) -> HttpResponse:
-    article = get_object_or_404(_news_card_queryset(), pk=pk)
+    article = _news_card_queryset().filter(pk=pk).first()
+    if article is None:
+        article = (
+            Article.objects.filter(
+                is_review_approved=True,
+                editorial_status="approved",
+                content_profile="product",
+            )
+            .select_related("newsletter")
+            .prefetch_related("categories")
+            .filter(pk=pk)
+            .first()
+        )
+    if article is None:
+        raise Http404("Article not found")
     if not article.is_read:
         article.is_read = True
         article.save(update_fields=["is_read"])
@@ -210,8 +224,35 @@ def article_card_preview(request: HttpRequest, token) -> HttpResponse:
 
 @require_GET
 def article_card_public(request: HttpRequest, pk: int) -> HttpResponse:
-    article = get_object_or_404(_news_card_queryset(), pk=pk)
-    context_cards = list(_base_queryset().exclude(id=article.id).order_by("-published_at")[:5])
+    article = _news_card_queryset().filter(pk=pk).first()
+    detail_path = ""
+    if article is None:
+        article = (
+            Article.objects.filter(
+                is_review_approved=True,
+                editorial_status="approved",
+                content_profile="product",
+            )
+            .select_related("newsletter")
+            .prefetch_related("categories")
+            .filter(pk=pk)
+            .first()
+        )
+        if article is None:
+            raise Http404("Article not found")
+        context_cards = list(
+            Article.objects.filter(
+                is_review_approved=True,
+                editorial_status="approved",
+                content_profile="product",
+            )
+            .exclude(id=article.id)
+            .order_by("-published_at")[:5]
+        )
+        detail_path = f"/products/{article.id}/"
+    else:
+        context_cards = list(_base_queryset().exclude(id=article.id).order_by("-published_at")[:5])
+        detail_path = f"/article/{article.id}/"
     cards = [article, *context_cards]
     placeholder_count = max(0, 6 - len(cards))
 
@@ -221,7 +262,7 @@ def article_card_public(request: HttpRequest, pk: int) -> HttpResponse:
         {
             "article": article,
             "is_preview": False,
-            "detail_preview_path": f"/article/{article.id}/",
+            "detail_preview_path": detail_path,
             "cards": cards,
             "target_id": article.id,
             "placeholder_range": range(placeholder_count),

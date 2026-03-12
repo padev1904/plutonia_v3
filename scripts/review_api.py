@@ -2958,7 +2958,10 @@ def _format_publication_confirmation(article: dict[str, Any], resource: dict[str
         lines.append(f"Recurso: {public_url or 'link publico indisponivel'}")
     else:
         article_id = article.get("id")
-        public_url = _build_external_public_url(f"/article/{int(article_id)}/card/") if article_id else ""
+        if article_id and content_profile == "product":
+            public_url = _build_external_public_url(f"/products/{int(article_id)}/card/")
+        else:
+            public_url = _build_external_public_url(f"/article/{int(article_id)}/card/") if article_id else ""
         lines.append(f"Card: {public_url or 'link publico indisponivel'}")
     return "\n".join(lines)
 

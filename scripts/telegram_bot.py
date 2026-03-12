@@ -923,6 +923,9 @@ def _public_card_url_for_article(article: dict[str, Any]) -> str:
     if not article_id:
         return ""
     try:
+        content_profile = str(article.get("content_profile", "news")).strip().lower() or "news"
+        if content_profile == "product":
+            return _build_public_preview_url(f"/products/{int(article_id)}/card/")
         return _build_public_preview_url(f"/article/{int(article_id)}/card/")
     except Exception:
         return ""

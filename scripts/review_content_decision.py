@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import sys
 from pathlib import Path
 
@@ -151,6 +152,26 @@ def _fallback_revision_source_text(article: dict, *, max_chars: int) -> str:
     return combined[:max_chars].strip()
 
 
+def _clean_revision_source_text(text: str) -> str:
+    cleaned = " ".join(str(text or "").split()).strip()
+    if not cleaned:
+        return ""
+    cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
+    return cleaned
+
+
+def _revision_context_limits(max_chars: int) -> list[int]:
+    cap = max(180, int(max_chars))
+    desired = [min(cap, 3200), min(cap, 2200), min(cap, 1500), min(cap, 1000)]
+    limits: list[int] = []
+    for value in desired:
+        if value >= 180 and value not in limits:
+            limits.append(value)
+    if not limits:
+        limits.append(cap)
+    return limits
+
+
 def _build_revision_payload(cfg: Config, article: dict, instructions: str, source_text_override: str, max_source_chars: int) -> dict:
     source_url = str(article.get("original_url", "")).strip()
     source_text = source_text_override.strip()
@@ -161,6 +182,9 @@ def _build_revision_payload(cfg: Config, article: dict, instructions: str, sourc
         fallback_text = _fallback_revision_source_text(article, max_chars=max_source_chars)
         if len(fallback_text) > len(source_text):
             source_text = fallback_text
+    cleaned_source_text = _clean_revision_source_text(source_text)
+    if len(cleaned_source_text) >= 180:
+        source_text = cleaned_source_text
     source_text = source_text[:max_source_chars]
 
     if len(source_text) < 180:
@@ -169,23 +193,54 @@ def _build_revision_payload(cfg: Config, article: dict, instructions: str, sourc
             "Provide full text via --source-text/file/stdin."
         )
 
+    prompt_summary = str(article.get("summary", "")).strip()
+    prompt_article_body = str(article.get("article_body", "")).strip()
+    if len(source_text) >= 180:
+        prompt_summary = ""
+        prompt_article_body = ""
+
     _assert_required_summary_model(cfg)
-    prompt = REVISION_PROMPT.format(
-        title=str(article.get("title", "")).strip()[:500],
-        summary=str(article.get("summary", "")).strip(),
-        article_body=str(article.get("article_body", "")).strip(),
-        source_url=source_url or "unknown",
-        section=str(article.get("section", "")).strip(),
-        category=str(article.get("category", "")).strip(),
-        subcategory=str(article.get("subcategory", "")).strip(),
-        categories=", ".join([str(c).strip() for c in article.get("categories", []) if str(c).strip()]) or "None",
-        instructions=instructions.strip(),
-        source_text=source_text,
-    )
-    response = _llm_generate(cfg, prompt)
-    parsed = _safe_json_object(response)
+    parsed = None
+    last_err: Exception | None = None
+    limits = _revision_context_limits(min(max_source_chars, len(source_text)))
+    for attempt, limit in enumerate(limits, start=1):
+        prompt = REVISION_PROMPT.format(
+            title=str(article.get("title", "")).strip()[:500],
+            summary=prompt_summary,
+            article_body=prompt_article_body,
+            source_url=source_url or "unknown",
+            section=str(article.get("section", "")).strip(),
+            category=str(article.get("category", "")).strip(),
+            subcategory=str(article.get("subcategory", "")).strip(),
+            categories=", ".join([str(c).strip() for c in article.get("categories", []) if str(c).strip()]) or "None",
+            instructions=instructions.strip(),
+            source_text=source_text[:limit].strip(),
+        )
+        try:
+            response = _llm_generate(cfg, prompt)
+            parsed = _safe_json_object(response)
+            if parsed:
+                if attempt > 1:
+                    LOG.info(
+                        "revision succeeded after context backoff article_id=%s attempt=%s context_chars=%s",
+                        article.get("id"),
+                        attempt,
+                        limit,
+                    )
+                break
+            last_err = RuntimeError("revision failed: model did not return valid JSON")
+        except Exception as exc:
+            last_err = exc
+            LOG.warning(
+                "revision llm failed article_id=%s attempt=%s context_chars=%s err=%s",
+                article.get("id"),
+                attempt,
+                limit,
+                exc,
+            )
+
     if not parsed:
-        raise SystemExit("revision failed: model did not return valid JSON")
+        raise SystemExit(f"revision failed after context backoff: {last_err}")
 
     title = str(parsed.get("title", "")).strip()[:500]
     summary = _normalize_summary_text(str(parsed.get("summary", "")))

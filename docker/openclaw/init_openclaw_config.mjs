@@ -115,10 +115,10 @@ const config = fs.existsSync(configPath)
   ? JSON.parse(fs.readFileSync(configPath, "utf8"))
   : {};
 const controllerModel = buildModelSpec("OPENCLAW_CONTROLLER", {
-  id: modelId || "qwen3.5:27b",
-  name: modelName || modelId || "qwen3.5:27b",
-  contextWindow: modelContextWindow || 32768,
-  maxTokens: modelMaxTokens || modelContextWindow || 32768,
+  id: modelId || "qwen3.5:9b",
+  name: modelName || modelId || "qwen3.5:9b",
+  contextWindow: modelContextWindow || 8192,
+  maxTokens: modelMaxTokens || modelContextWindow || 8192,
 });
 const coderModel = buildModelSpec("OPENCLAW_CODER", {
   id: "qwen3-coder:latest",
@@ -127,10 +127,10 @@ const coderModel = buildModelSpec("OPENCLAW_CODER", {
   maxTokens: 32768,
 });
 const reviewerModel = buildModelSpec("OPENCLAW_REVIEWER", {
-  id: controllerModel.id || "qwen3.5:27b",
-  name: controllerModel.name || controllerModel.id || "qwen3.5:27b",
-  contextWindow: 32768,
-  maxTokens: 32768,
+  id: controllerModel.id || "qwen3.5:9b",
+  name: controllerModel.name || controllerModel.id || "qwen3.5:9b",
+  contextWindow: 8192,
+  maxTokens: 8192,
 });
 const editorialModel = buildModelSpec("OPENCLAW_EDITORIAL", {
   id: "qwen3:14b-16k",

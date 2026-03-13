@@ -1478,18 +1478,21 @@ def _web_image_search_cache_key(article: dict[str, Any]) -> str:
     return json.dumps(payload, sort_keys=True)
 
 
-def _article_has_resolved_image(article: dict[str, Any]) -> bool:
-    if _normalize_url(str(article.get("image_url", "")).strip()):
-        return True
-    if _normalize_url(str(article.get("source_image_url", "")).strip()):
-        return True
-    email_images = article.get("email_images", []) or []
-    if not isinstance(email_images, list):
-        email_images = [email_images]
-    for row in email_images:
-        if _normalize_url(str(row).strip()):
-            return True
-    return False
+def _article_has_resolved_image(article: dict[str, Any]) -> bool:
+    image_url = _normalize_url(str(article.get("image_url", "")).strip())
+    if image_url and not _is_blocked_web_image_asset(image_url):
+        return True
+    source_image_url = _normalize_url(str(article.get("source_image_url", "")).strip())
+    if source_image_url and not _is_blocked_web_image_asset(source_image_url):
+        return True
+    email_images = article.get("email_images", []) or []
+    if not isinstance(email_images, list):
+        email_images = [email_images]
+    for row in email_images:
+        candidate = _normalize_url(str(row).strip())
+        if candidate and not _is_blocked_web_image_asset(candidate):
+            return True
+    return False
 
 
 def _build_web_image_queries(article: dict[str, Any]) -> list[str]:

@@ -35,9 +35,11 @@ from telegram.ext import (
 )
 
 from process_newsletter import (
+    _apply_source_metadata,
     Config,
     _assert_required_summary_model,
     _get_source_snapshot,
+    _is_blocked_web_image_asset,
     _llm_generate,
     _openclaw_generate,
     _normalize_article_body_text,
@@ -651,7 +653,20 @@ def _build_preview_revision_payload(cfg: Config, article: dict, instructions: st
         raise RuntimeError(f"revision failed after context backoff: {last_err}")
 
     categories = _normalize_keywords(parsed.get("categories", []), limit=10)
-    return {
+    resolved_image_url = _normalize_url(str(article.get("image_url", "")).strip())
+    if not resolved_image_url or _is_blocked_web_image_asset(resolved_image_url):
+        try:
+            enriched = _apply_source_metadata(dict(article), cfg)
+            candidate_image = (
+                _normalize_url(str(enriched.get("source_image_url", "")).strip())
+                or _normalize_url(str(enriched.get("image_url", "")).strip())
+            )
+            if candidate_image and not _is_blocked_web_image_asset(candidate_image):
+                resolved_image_url = candidate_image
+        except Exception as exc:
+            LOG.warning("preview revision image enrichment failed article_id=%s err=%s", article.get("id"), exc)
+
+    payload = {
         "decision": "revise",
         "title": str(parsed.get("title", "")).strip()[:500] or str(article.get("title", "")).strip()[:500],
         "summary": _fit_card_summary(str(parsed.get("summary", ""))) or _fit_card_summary(str(article.get("summary", "")).strip()),
@@ -662,6 +677,9 @@ def _build_preview_revision_payload(cfg: Config, article: dict, instructions: st
         "categories": categories or article.get("categories", []),
         "comment": f"Revision requested: {instructions.strip()}",
     }
+    if resolved_image_url and not _is_blocked_web_image_asset(resolved_image_url):
+        payload["image_url"] = resolved_image_url
+    return payload
 
 
 def propose_title(cfg: Config, text: str, content_profile: str = "news") -> str | None:

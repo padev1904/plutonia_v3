@@ -749,6 +749,9 @@ def apply_article_editorial_decision(request):
     if "article_body" in data:
         article.enrichment_context = str(data.get("article_body", "")).strip()
         update_fields.append("enrichment_context")
+    if "image_url" in data:
+        article.image_url = str(data.get("image_url", "")).strip()[:2000]
+        update_fields.append("image_url")
     if "original_url" in data:
         article.original_url = str(data.get("original_url", "")).strip()
         update_fields.append("original_url")

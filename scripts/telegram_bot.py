@@ -41,6 +41,7 @@ from process_newsletter import (
     _get_source_snapshot,
     _is_blocked_web_image_asset,
     _llm_generate,
+    _normalize_url,
     _openclaw_generate,
     _normalize_article_body_text,
     _normalize_keywords,

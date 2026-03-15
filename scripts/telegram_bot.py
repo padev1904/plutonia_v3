@@ -391,6 +391,100 @@ def _recover_pending_input_from_editorial_state(cfg: Config) -> dict[str, Any] |
     return None
 
 
+def _normalize_command_text(text: str) -> str:
+    normalized = unicodedata.normalize("NFKD", str(text or ""))
+    ascii_text = normalized.encode("ascii", "ignore").decode("ascii")
+    ascii_text = ascii_text.lower()
+    ascii_text = re.sub(r"\s+", " ", ascii_text).strip()
+    return ascii_text
+
+
+def _looks_like_resend_triage_request(text: str) -> bool:
+    normalized = _normalize_command_text(text)
+    if not normalized:
+        return False
+    resend_terms = ("reenvia", "reenvie", "retoma", "recomeca", "recomeca o envio", "envia")
+    target_terms = ("aprovacao", "aprovar", "preview", "triagem", "artigo", "artigos", "noticia", "noticias", "newsletter")
+    return any(term in normalized for term in resend_terms) and any(term in normalized for term in target_terms)
+
+
+async def _force_resend_active_triage(bot, cfg: Config) -> bool:
+    params: dict[str, Any] = {
+        "mode": "oldest",
+        "exclude_tg_triaged": "true",
+    }
+    if TELEGRAM_TRIAGE_NEWSLETTER_ID:
+        params["newsletter_id"] = TELEGRAM_TRIAGE_NEWSLETTER_ID
+    result = _api_get(cfg, "articles/editorial-pending/", params)
+    article = result.get("article") if isinstance(result, dict) else None
+    if not isinstance(article, dict):
+        return False
+    try:
+        article_id = int(article.get("id") or 0)
+    except Exception:
+        article_id = 0
+    if article_id <= 0:
+        return False
+
+    current_profile = str(article.get("content_profile", "news")).strip().lower() or "news"
+    process_origin = str(article.get("source_link_origin", "email")).strip().lower() or "email"
+    source_mode = "manual" if process_origin == "user" else "process"
+    original_url = str(article.get("original_url", "")).strip()
+    process_url = original_url if source_mode == "process" else ""
+    manual_url = original_url if source_mode == "manual" else ""
+
+    with _TRIAGE_SENT_LOCK:
+        _TRIAGE_SENT_IDS.discard(article_id)
+    _pop_message1_state(article_id)
+    _reset_message1_state(article, process_url=process_url, process_origin=process_origin)
+    selection_state = _update_message1_state(
+        article_id,
+        content_profile=current_profile,
+        source_mode=source_mode,
+        process_url=process_url,
+        manual_url=manual_url,
+        process_origin=process_origin,
+    )
+    newsletter_meta = _load_newsletter_meta(cfg, article.get("newsletter_id"))
+    proposed_title = str(article.get("proposed_title", "")).strip() or str(article.get("title", "")).strip()
+    preview = _format_triage_preview(
+        article,
+        selection_state,
+        proposed_title=proposed_title,
+        newsletter_meta=newsletter_meta,
+    )
+    reply_markup = _triage_buttons(article_id, selection_state)
+    sent = False
+    try:
+        await bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID,
+            text=preview,
+            parse_mode="HTML",
+            reply_markup=reply_markup,
+            disable_web_page_preview=True,
+        )
+        sent = True
+    except Exception as exc:
+        LOG.warning("forced triage HTML send failed article_id=%s err=%s", article_id, exc)
+        try:
+            plain = re.sub(r"</?[^>]+>", "", preview)
+            await bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID,
+                text=plain,
+                reply_markup=reply_markup,
+                disable_web_page_preview=True,
+            )
+            sent = True
+        except Exception as exc2:
+            LOG.error("forced triage send failed article_id=%s err=%s", article_id, exc2)
+    if not sent:
+        return False
+    with _TRIAGE_SENT_LOCK:
+        _TRIAGE_SENT_IDS.add(article_id)
+    LOG.info("Forced triage resend sent for article_id=%s", article_id)
+    return True
+
+
 
 # ---------------------------------------------------------------------------
 # Title generation (Fase 3 - mandatory LLM title)
@@ -1469,6 +1563,30 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     cfg = _get_cfg()
+    if _looks_like_resend_triage_request(user_text):
+        if chat_id:
+            _pop_pending_input(chat_id)
+        try:
+            resent = await _force_resend_active_triage(context.bot, cfg)
+        except Exception as e:
+            LOG.warning("forced triage resend failed: %s", e)
+            await update.message.reply_text(
+                "Nao consegui reenviar a triagem neste momento. Tenta novamente.",
+                disable_web_page_preview=True,
+            )
+            return
+        if resent:
+            await update.message.reply_text(
+                "Vou reenviar o artigo atual para triagem.",
+                disable_web_page_preview=True,
+            )
+        else:
+            await update.message.reply_text(
+                "Nao ha artigos editoriais pendentes para reenviar.",
+                disable_web_page_preview=True,
+            )
+        return
+
     pending = _pop_pending_input(chat_id) if chat_id else None
     if not pending:
         pending = _recover_pending_input_from_editorial_state(cfg)

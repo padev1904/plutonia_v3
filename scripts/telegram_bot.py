@@ -749,17 +749,16 @@ def _build_preview_revision_payload(cfg: Config, article: dict, instructions: st
 
     categories = _normalize_keywords(parsed.get("categories", []), limit=10)
     resolved_image_url = _normalize_url(str(article.get("image_url", "")).strip())
-    if not resolved_image_url or _is_blocked_web_image_asset(resolved_image_url):
-        try:
-            enriched = _apply_source_metadata(dict(article), cfg)
-            candidate_image = (
-                _normalize_url(str(enriched.get("source_image_url", "")).strip())
-                or _normalize_url(str(enriched.get("image_url", "")).strip())
-            )
-            if candidate_image and not _is_blocked_web_image_asset(candidate_image):
-                resolved_image_url = candidate_image
-        except Exception as exc:
-            LOG.warning("preview revision image enrichment failed article_id=%s err=%s", article.get("id"), exc)
+    try:
+        enriched = _apply_source_metadata(dict(article), cfg)
+        candidate_source_image = _normalize_url(str(enriched.get("source_image_url", "")).strip())
+        candidate_image = candidate_source_image or _normalize_url(str(enriched.get("image_url", "")).strip())
+        if candidate_source_image and not _is_blocked_web_image_asset(candidate_source_image):
+            resolved_image_url = candidate_source_image
+        elif (not resolved_image_url or _is_blocked_web_image_asset(resolved_image_url)) and candidate_image and not _is_blocked_web_image_asset(candidate_image):
+            resolved_image_url = candidate_image
+    except Exception as exc:
+        LOG.warning("preview revision image enrichment failed article_id=%s err=%s", article.get("id"), exc)
 
     payload = {
         "decision": "revise",

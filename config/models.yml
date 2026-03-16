@@ -4,4 +4,4 @@ routing:
   general: "qwen3:32b"
   embeddings: "mxbai-embed-large"
 
-ollama_base_url: "http://ollama:11434"
+ollama_base_url: "http://127.0.0.1:11434"

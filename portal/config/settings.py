@@ -3,9 +3,10 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = BASE_DIR.parent
 
 env = environ.Env()
-environ.Env.read_env(BASE_DIR.parent / ".env")
+environ.Env.read_env(PROJECT_ROOT / ".env")
 
 SECRET_KEY = env("DJANGO_SECRET_KEY", default="insecure-dev-key")
 DEBUG = env.bool("DJANGO_DEBUG", default=False)
@@ -93,7 +94,7 @@ DATABASES = {
         "NAME": env("POSTGRES_DB", default="plutonia"),
         "USER": env("POSTGRES_USER", default="python"),
         "PASSWORD": env("POSTGRES_PASSWORD", default=""),
-        "HOST": env("POSTGRES_HOST", default="postgres"),
+        "HOST": env("POSTGRES_HOST", default="127.0.0.1"),
         "PORT": env("POSTGRES_PORT", default="5432"),
     }
 }
@@ -111,7 +112,7 @@ USE_I18N = True
 USE_TZ = True
 
 STATIC_URL = "/static/"
-STATIC_ROOT = BASE_DIR / "staticfiles"
+STATIC_ROOT = Path(env("PLUTONIA_STATIC_DIR", default=str(PROJECT_ROOT / "staticfiles")))
 STATICFILES_DIRS = [BASE_DIR / "static"]
 STORAGES = {
     "staticfiles": {
@@ -121,19 +122,20 @@ STORAGES = {
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
-OLLAMA_HOST = env("OLLAMA_HOST", default="http://ollama:11434")
+OLLAMA_HOST = env("OLLAMA_HOST", default="http://127.0.0.1:11434")
 OLLAMA_MODEL = env("OLLAMA_MODEL", default="qwen3:32b")
-SEARXNG_URL = env("SEARXNG_URL", default="http://searxng:8080")
+SEARXNG_URL = env("SEARXNG_URL", default="http://127.0.0.1:8080")
 AGENT_API_KEY = env("AGENT_API_KEY", default="change-me")
-REVIEW_API_BASE_URL = env("REVIEW_API_BASE_URL", default="http://ainews-gmail-monitor:8001")
+REVIEW_API_BASE_URL = env("REVIEW_API_BASE_URL", default="http://127.0.0.1:8001")
 REVIEW_SIGNATURE_SECRET = env("REVIEW_SIGNATURE_SECRET", default="")
 
 DJANGO_SUPERUSER_USERNAME = env("DJANGO_SUPERUSER_USERNAME", default="admin")
 DJANGO_SUPERUSER_PASSWORD = env("DJANGO_SUPERUSER_PASSWORD", default="admin")
 DJANGO_SUPERUSER_EMAIL = env("DJANGO_SUPERUSER_EMAIL", default="admin@localhost")
 
-LOG_FILE = env("PORTAL_LOG_FILE", default=str(BASE_DIR / "logs" / "portal.log"))
+LOG_FILE = env("PORTAL_LOG_FILE", default=str(PROJECT_ROOT / "logs" / "portal.log"))
 Path(LOG_FILE).parent.mkdir(parents=True, exist_ok=True)
+Path(STATIC_ROOT).mkdir(parents=True, exist_ok=True)
 
 LOGGING = {
     "version": 1,

@@ -2,24 +2,53 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "${ROOT_DIR}"
-COMPOSE_CMD=(docker compose -p plutonia-ainews -f "${ROOT_DIR}/docker-compose.yml")
+source "${ROOT_DIR}/scripts/lib_paths.sh"
 
-echo "[clean-restart] removing legacy ai-news-portal project containers (name-collision guard)..."
-if [ -f /home/python/ai-news-portal/docker-compose.yml ]; then
-  docker compose -p ai-news-portal -f /home/python/ai-news-portal/docker-compose.yml down --remove-orphans >/dev/null 2>&1 || true
+if [ -f "${ROOT_DIR}/.env" ]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "${ROOT_DIR}/.env"
+  set +a
 fi
-for cname in ainews-portal ainews-nginx ainews-gmail-monitor ainews-cloudflared; do
-  docker rm -f "${cname}" >/dev/null 2>&1 || true
-done
 
-echo "[clean-restart] ensuring core compose services and removing orphans..."
-"${COMPOSE_CMD[@]}" up -d --remove-orphans portal nginx cloudflared >/dev/null
+PYTHON_BIN="${PYTHON_BIN:-${ROOT_DIR}/.venv/bin/python}"
+MANAGE_PY="${ROOT_DIR}/portal/manage.py"
+PORTAL_SERVICE="${PORTAL_SERVICE:-plutonia-portal}"
+MONITOR_SERVICE="${MONITOR_SERVICE:-plutonia-monitor}"
 
-echo "[clean-restart] waiting for portal service..."
+if [ ! -x "${PYTHON_BIN}" ]; then
+  echo "[clean-restart] missing python interpreter: ${PYTHON_BIN}" >&2
+  exit 1
+fi
+
+if [ ! -f "${MANAGE_PY}" ]; then
+  echo "[clean-restart] missing manage.py: ${MANAGE_PY}" >&2
+  exit 1
+fi
+
+service_exists() {
+  command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files "$1.service" >/dev/null 2>&1
+}
+
+service_stop() {
+  if service_exists "$1"; then
+    systemctl stop "$1"
+  fi
+}
+
+service_start() {
+  if service_exists "$1"; then
+    systemctl start "$1"
+  fi
+}
+
+echo "[clean-restart] ensuring runtime directories..."
+mkdir -p "${PLUTONIA_REVIEW_DIR}" "${PLUTONIA_LOG_DIR}" "${PLUTONIA_RUN_DIR}" "${PLUTONIA_BACKUP_DIR}" "${PLUTONIA_STATIC_DIR}"
+
+echo "[clean-restart] waiting for portal checks..."
 portal_ready=0
 for i in $(seq 1 40); do
-  if "${COMPOSE_CMD[@]}" exec -T portal python manage.py check >/dev/null 2>&1; then
+  if "${PYTHON_BIN}" "${MANAGE_PY}" check >/dev/null 2>&1; then
     portal_ready=1
     break
   fi
@@ -28,7 +57,7 @@ done
 test "${portal_ready}" -eq 1
 
 echo "[clean-restart] preflight snapshot..."
-"${COMPOSE_CMD[@]}" exec -T portal python manage.py shell -c "
+"${PYTHON_BIN}" "${MANAGE_PY}" shell -c "
 from news.models import Newsletter, Article, ProcessingLog, Resource, Category
 print({
   'newsletters': Newsletter.objects.count(),
@@ -47,11 +76,11 @@ print({
 })
 "
 
-echo "[clean-restart] stopping gmail-monitor..."
-"${COMPOSE_CMD[@]}" stop gmail-monitor
+echo "[clean-restart] stopping monitor service..."
+service_stop "${MONITOR_SERVICE}"
 
 echo "[clean-restart] cleaning transient rows (preserving public published content)..."
-"${COMPOSE_CMD[@]}" exec -T portal python manage.py shell -c "
+"${PYTHON_BIN}" "${MANAGE_PY}" shell -c "
 from django.db import connection
 from django.utils import timezone
 from news.models import Newsletter, Article, ProcessingLog, Resource, Category
@@ -124,49 +153,17 @@ print({
 "
 
 echo "[clean-restart] clearing review artifacts..."
-find review -maxdepth 1 -type f \( -name 'newsletter_*' -o -name 'resource_*' \) -delete
+find "${PLUTONIA_REVIEW_DIR}" -maxdepth 1 -type f \( -name 'newsletter_*' -o -name 'resource_*' \) -delete
 
-remaining_review_files="$(find review -maxdepth 1 -type f \( -name 'newsletter_*' -o -name 'resource_*' \) | wc -l)"
+remaining_review_files="$(find "${PLUTONIA_REVIEW_DIR}" -maxdepth 1 -type f \( -name 'newsletter_*' -o -name 'resource_*' \) | wc -l)"
 echo "[clean-restart] review artifacts remaining=${remaining_review_files}"
 test "${remaining_review_files}" -eq 0
 
-echo "[clean-restart] rotating OpenClaw main sessions..."
-if docker ps -a --format '{{.Names}}' | grep -q '^plutonia-openclaw$'; then
-  docker exec plutonia-openclaw sh -lc '
-set -e
-d="/root/.openclaw/agents/main/sessions"
-mkdir -p "${d}/archive"
-ts="$(date -u +%Y%m%dT%H%M%SZ)"
-for f in "${d}"/*.jsonl; do
-  [ -f "${f}" ] || continue
-  mv "${f}" "${d}/archive/$(basename "${f}").${ts}"
-done
-printf "{}\n" > "${d}/sessions.json"
-'
-  docker restart plutonia-openclaw >/dev/null
-  session_jsonl_count="$(docker exec plutonia-openclaw sh -lc 'find /root/.openclaw/agents/main/sessions -maxdepth 1 -type f -name \"*.jsonl\" | wc -l')"
-  echo "[clean-restart] openclaw active session files=${session_jsonl_count}"
-  test "${session_jsonl_count}" -eq 0
-
-  echo "[clean-restart] validating OpenClaw review hard-guard marker..."
-  hardguard_hits="$(docker exec plutonia-openclaw sh -lc 'grep -R "__PLUTONIA_REVIEW_NO_REPLY_GUARD_V6__" -n /usr/local/lib/node_modules/openclaw/dist/reply-*.js /usr/local/lib/node_modules/openclaw/dist/plugin-sdk/reply-*.js | wc -l')"
-  if [ "${hardguard_hits}" -lt 2 ]; then
-    echo "[clean-restart] hard-guard marker V6 missing -> rebuilding openclaw image..."
-    "${COMPOSE_CMD[@]}" build openclaw
-    "${COMPOSE_CMD[@]}" up -d --no-deps --force-recreate openclaw
-    hardguard_hits="$(docker exec plutonia-openclaw sh -lc 'grep -R "__PLUTONIA_REVIEW_NO_REPLY_GUARD_V6__" -n /usr/local/lib/node_modules/openclaw/dist/reply-*.js /usr/local/lib/node_modules/openclaw/dist/plugin-sdk/reply-*.js | wc -l')"
-  fi
-  echo "[clean-restart] openclaw hard-guard marker hits=${hardguard_hits}"
-  test "${hardguard_hits}" -ge 2
-fi
-
-echo "[clean-restart] starting gmail-monitor..."
-# Recreate from base compose to avoid inheriting debug container runtime
-# (e.g., DEBUGPY_WAIT_FOR_CLIENT=true from docker-compose.debug.yml sessions).
-"${COMPOSE_CMD[@]}" up -d --no-deps --force-recreate gmail-monitor
+echo "[clean-restart] starting monitor service..."
+service_start "${MONITOR_SERVICE}"
 
 echo "[clean-restart] post-check: db counters..."
-"${COMPOSE_CMD[@]}" exec -T portal python manage.py shell -c "
+"${PYTHON_BIN}" "${MANAGE_PY}" shell -c "
 from news.models import Newsletter, Article, ProcessingLog, Resource, Category
 state = {
   'newsletters_total': Newsletter.objects.count(),
@@ -193,9 +190,10 @@ assert state['resources_non_public'] == 0, state
 
 echo "[clean-restart] post-check: review API health..."
 health_ok=0
+health_file="${PLUTONIA_RUN_DIR}/review_health.json"
 for i in $(seq 1 20); do
-  if docker exec plutonia-openclaw curl -fsS -m 3 http://ainews-gmail-monitor:8001/healthz >/tmp/review_health.json 2>/dev/null; then
-    cat /tmp/review_health.json
+  if curl -fsS -m 3 http://127.0.0.1:8001/healthz >"${health_file}" 2>/dev/null; then
+    cat "${health_file}"
     health_ok=1
     break
   fi

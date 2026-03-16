@@ -1,0 +1,18 @@
+[Unit]
+Description=Plutonia Gmail Monitor
+After=network.target plutonia-portal.service
+Requires=plutonia-portal.service
+
+[Service]
+Type=simple
+User=python
+Group=python
+WorkingDirectory=/home/python/demos/plutonia/ainews
+Environment=PLUTONIA_ROOT=/home/python/demos/plutonia/ainews
+EnvironmentFile=/home/python/demos/plutonia/ainews/.env
+ExecStart=/home/python/demos/plutonia/ainews/scripts/run_monitor.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

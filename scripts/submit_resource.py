@@ -52,7 +52,7 @@ def main() -> int:
     parser.add_argument("--review-required", default="true", choices=["true", "false"], help="Queue Telegram approval before public release")
     parser.add_argument(
         "--api-url",
-        default="http://ainews-gmail-monitor:8001/api/review/resource-submit",
+        default="http://127.0.0.1:8001/api/review/resource-submit",
         help="Review API endpoint",
     )
     parser.add_argument("--secret", default=os.getenv("REVIEW_SIGNATURE_SECRET", ""), help="HMAC secret")

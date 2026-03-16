@@ -114,7 +114,7 @@ def _call_ollama_for_validation(
 
     NOTE: Calls Ollama directly (not via _llm_generate) intentionally.
     Link validation is a lightweight, fast task that should always use
-    Ollama even when the main pipeline uses OpenClaw. This is consistent
+    Ollama even when the main pipeline uses a different summary backend. This is consistent
     with the local agent's original behavior.
     """
     prompt = LINK_VALIDATION_PROMPT.format(

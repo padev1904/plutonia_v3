@@ -2,38 +2,38 @@
   "version": "2.0.0",
   "tasks": [
     {
-      "label": "ai-news: clean restart (monitor stopped)",
+      "label": "plutonia: bootstrap native",
       "type": "shell",
-      "command": "bash -lc './scripts/restart_clean.sh && docker compose stop gmail-monitor'",
+      "command": "bash -lc './scripts/bootstrap_native.sh'",
       "options": {
-        "cwd": "/opt/plutonia/ai-news-portal"
+        "cwd": "/home/python/demos/plutonia/ainews"
       },
       "problemMatcher": []
     },
     {
-      "label": "ai-news: start gmail-monitor debug mode",
+      "label": "plutonia: clean restart",
       "type": "shell",
-      "command": "bash -lc 'docker compose -f docker-compose.yml -f docker-compose.debug.yml up -d --build --force-recreate gmail-monitor'",
+      "command": "bash -lc './scripts/restart_clean.sh'",
       "options": {
-        "cwd": "/opt/plutonia/ai-news-portal"
+        "cwd": "/home/python/demos/plutonia/ainews"
       },
       "problemMatcher": []
     },
     {
-      "label": "ai-news: debug bootstrap (clean)",
-      "dependsOrder": "sequence",
-      "dependsOn": [
-        "ai-news: clean restart (monitor stopped)",
-        "ai-news: start gmail-monitor debug mode"
-      ],
+      "label": "plutonia: portal check",
+      "type": "shell",
+      "command": "bash -lc '.venv/bin/python portal/manage.py check'",
+      "options": {
+        "cwd": "/home/python/demos/plutonia/ainews"
+      },
       "problemMatcher": []
     },
     {
-      "label": "ai-news: stop debug and restore normal monitor",
+      "label": "plutonia: health check",
       "type": "shell",
-      "command": "bash -lc 'docker compose stop gmail-monitor && docker compose up -d --force-recreate gmail-monitor'",
+      "command": "bash -lc './scripts/health_check.sh'",
       "options": {
-        "cwd": "/opt/plutonia/ai-news-portal"
+        "cwd": "/home/python/demos/plutonia/ainews"
       },
       "problemMatcher": []
     }

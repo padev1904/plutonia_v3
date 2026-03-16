@@ -93,8 +93,8 @@ def _resource_queryset():
 
 
 def _review_api_base_url() -> str:
-    value = str(getattr(settings, "REVIEW_API_BASE_URL", "http://ainews-gmail-monitor:8001")).strip().rstrip("/")
-    return value or "http://ainews-gmail-monitor:8001"
+    value = str(getattr(settings, "REVIEW_API_BASE_URL", "http://127.0.0.1:8001")).strip().rstrip("/")
+    return value or "http://127.0.0.1:8001"
 
 
 def _sign_resource_submit(resource_url: str) -> dict[str, str | int]:

@@ -19,8 +19,8 @@ import logging
 import os
 import re
 import threading
-import unicodedata
 import time
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +33,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from runtime_paths import REVIEW_DIR, WATCHDOG_STATUS_FILE as DEFAULT_WATCHDOG_STATUS_FILE
 
 from process_newsletter import (
     Config,
@@ -55,15 +56,16 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 PORTAL_PUBLIC_BASE_URL = os.getenv("PORTAL_PUBLIC_BASE_URL", "").rstrip("/")
 TELEGRAM_TRIAGE_INTERVAL = int(os.getenv("TELEGRAM_TRIAGE_INTERVAL", "15"))
 TELEGRAM_TRIAGE_NEWSLETTER_ID = os.getenv("TELEGRAM_TRIAGE_NEWSLETTER_ID", "").strip()
-CLOUDFLARED_CONTAINER_NAME = os.getenv("CLOUDFLARED_CONTAINER_NAME", "ainews-cloudflared").strip()
-REVIEW_OUTPUT_DIR = os.getenv("REVIEW_OUTPUT_DIR", "/review").strip() or "/review"
-WATCHDOG_STATUS_FILE = os.getenv("WATCHDOG_STATUS_FILE", "/review/ops_watchdog_status.json").strip() or "/review/ops_watchdog_status.json"
+REVIEW_OUTPUT_DIR = os.getenv("REVIEW_OUTPUT_DIR", str(REVIEW_DIR)).strip() or str(REVIEW_DIR)
+WATCHDOG_STATUS_FILE = (
+    os.getenv("WATCHDOG_STATUS_FILE", str(DEFAULT_WATCHDOG_STATUS_FILE)).strip()
+    or str(DEFAULT_WATCHDOG_STATUS_FILE)
+)
 
 # Per-task model configuration (Fase 6)
 OLLAMA_MODEL_TITLE = os.getenv("OLLAMA_MODEL_TITLE", "").strip()
 OLLAMA_MODEL_LINK_VALIDATION = os.getenv("OLLAMA_MODEL_LINK_VALIDATION", "").strip()
 _PUBLIC_BASE_CACHE: str | None = None
-_TRYCLOUDFLARE_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com", re.IGNORECASE)
 
 
 def _esc(text: str) -> str:
@@ -77,23 +79,6 @@ def _resolve_public_base_url() -> str:
     if PORTAL_PUBLIC_BASE_URL:
         _PUBLIC_BASE_CACHE = PORTAL_PUBLIC_BASE_URL
         return _PUBLIC_BASE_CACHE
-
-    for attempt in range(1, 6):
-        try:
-            import docker
-
-            client = docker.from_env()
-            container = client.containers.get(CLOUDFLARED_CONTAINER_NAME)
-            logs = container.logs(tail=500).decode("utf-8", errors="replace")
-            matches = _TRYCLOUDFLARE_RE.findall(logs)
-            if matches:
-                _PUBLIC_BASE_CACHE = matches[-1].rstrip("/")
-                return _PUBLIC_BASE_CACHE
-        except Exception as exc:
-            LOG.warning("failed to resolve public base url from cloudflared logs: %s", exc)
-            break
-        if attempt < 5:
-            time.sleep(1)
     return ""
 
 
@@ -344,6 +329,45 @@ def _build_status_reply(cfg: Config) -> str:
     return _format_pipeline_status_message(payload)
 
 
+def _build_idle_frontend_reply(cfg: Config, user_text: str) -> str:
+    if _looks_like_status_query(user_text):
+        return _build_status_reply(cfg)
+    return (
+        "Este bot fica agora dedicado ao fluxo editorial.\n"
+        "Usa os botoes inline para aprovar, rejeitar ou pedir alteracoes.\n"
+        "Podes enviar 'status' para ver o estado do pipeline."
+    )
+
+
+def _recover_pending_input_from_editorial_state(cfg: Config) -> dict[str, Any] | None:
+    try:
+        payload = _api_get(cfg, "articles/editorial-pending/", {"mode": "oldest", "exclude_tg_triaged": "true"})
+    except Exception as exc:
+        LOG.warning("failed to recover pending input context err=%s", exc)
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+    if str(payload.get("reason", "")).strip() != "active_triage_exists":
+        return None
+
+    article = payload.get("article")
+    if not isinstance(article, dict):
+        return None
+
+    try:
+        article_id = int(article.get("id") or 0)
+    except Exception:
+        article_id = 0
+    if article_id <= 0:
+        return None
+
+    tg_status = str(article.get("telegram_triage_status", "")).strip().lower()
+    if tg_status == "waiting_edit":
+        return {"article_id": article_id, "action": "requestchanges", "recovered": True}
+    return None
+
+
 
 # ---------------------------------------------------------------------------
 # Title generation (Fase 3 - mandatory LLM title)
@@ -518,6 +542,18 @@ def _fit_card_summary(text: str, *, max_chars: int = 220) -> str:
     return summary[:max_chars].rstrip()
 
 
+def _revision_context_limits(max_chars: int) -> list[int]:
+    cap = max(180, int(max_chars))
+    desired = [min(cap, 5000), min(cap, 3200), min(cap, 2200), min(cap, 1500)]
+    limits: list[int] = []
+    for value in desired:
+        if value >= 180 and value not in limits:
+            limits.append(value)
+    if not limits:
+        limits.append(cap)
+    return limits
+
+
 def _build_preview_revision_payload(cfg: Config, article: dict, instructions: str) -> dict[str, Any]:
     source_url = str(article.get("original_url", "")).strip()
     source_text = _load_draft_revision_context(article, max_chars=cfg.source_rewrite_max_chars)
@@ -551,22 +587,47 @@ def _build_preview_revision_payload(cfg: Config, article: dict, instructions: st
         prompt_article_body = ""
 
     _assert_required_summary_model(cfg)
-    prompt = PREVIEW_REVISION_PROMPT.format(
-        title=str(article.get("title", "")).strip()[:500],
-        summary=prompt_summary,
-        article_body=prompt_article_body,
-        source_url=source_url or "unknown",
-        section=str(article.get("section", "")).strip(),
-        category=str(article.get("category", "")).strip(),
-        subcategory=str(article.get("subcategory", "")).strip(),
-        categories=", ".join([str(c).strip() for c in article.get("categories", []) if str(c).strip()]) or "None",
-        instructions=instructions.strip(),
-        source_text=source_text,
-    )
-    response = _llm_generate(cfg, prompt)
-    parsed = _safe_json_object(response)
+    parsed: dict[str, Any] | None = None
+    last_err: Exception | None = None
+    limits = _revision_context_limits(min(cfg.source_rewrite_max_chars, len(source_text)))
+    for attempt, limit in enumerate(limits, start=1):
+        prompt = PREVIEW_REVISION_PROMPT.format(
+            title=str(article.get("title", "")).strip()[:500],
+            summary=prompt_summary,
+            article_body=prompt_article_body,
+            source_url=source_url or "unknown",
+            section=str(article.get("section", "")).strip(),
+            category=str(article.get("category", "")).strip(),
+            subcategory=str(article.get("subcategory", "")).strip(),
+            categories=", ".join([str(c).strip() for c in article.get("categories", []) if str(c).strip()]) or "None",
+            instructions=instructions.strip(),
+            source_text=source_text[:limit].strip(),
+        )
+        try:
+            response = _llm_generate(cfg, prompt)
+            parsed = _safe_json_object(response)
+            if parsed:
+                if attempt > 1:
+                    LOG.info(
+                        "preview revision succeeded after context backoff article_id=%s attempt=%s context_chars=%s",
+                        article.get("id"),
+                        attempt,
+                        limit,
+                    )
+                break
+            last_err = RuntimeError("revision failed: model did not return valid JSON")
+        except Exception as exc:
+            last_err = exc
+            LOG.warning(
+                "preview revision llm failed article_id=%s attempt=%s context_chars=%s err=%s",
+                article.get("id"),
+                attempt,
+                limit,
+                exc,
+            )
+
     if not parsed:
-        raise RuntimeError("revision failed: model did not return valid JSON")
+        raise RuntimeError(f"revision failed after context backoff: {last_err}")
 
     categories = _normalize_keywords(parsed.get("categories", []), limit=10)
     return {
@@ -1350,20 +1411,14 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     cfg = _get_cfg()
-    if _looks_like_status_query(user_text):
-        try:
-            await update.message.reply_text(
-                _build_status_reply(cfg),
-                disable_web_page_preview=True,
-            )
-        except Exception as exc:
-            await update.message.reply_text(f"Erro ao obter estado do pipeline: {exc}")
-        return
-
     pending = _pop_pending_input(chat_id) if chat_id else None
     if not pending:
+        pending = _recover_pending_input_from_editorial_state(cfg)
+    if not pending:
+        reply_text = _build_idle_frontend_reply(cfg, user_text)
+        if reply_text:
+            await update.message.reply_text(reply_text, disable_web_page_preview=True)
         return
-
 
     article_id = pending["article_id"]
     action = pending["action"]
@@ -1538,9 +1593,6 @@ async def _send_next_for_triage(bot, cfg: Config):
         if TELEGRAM_TRIAGE_NEWSLETTER_ID:
             params["newsletter_id"] = TELEGRAM_TRIAGE_NEWSLETTER_ID
         result = _api_get(cfg, "articles/editorial-pending/", params)
-        if result.get("status") != "ok":
-            return
-
         article = result.get("article")
         if not article:
             return

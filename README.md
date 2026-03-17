@@ -67,3 +67,19 @@ scripts/restart_clean.sh
 scripts/health_check.sh
 scripts/backup_db.sh
 ```
+
+## Parser Replay
+
+Cache the useful `text/html` or `text/plain` body part of the first 1000 eligible mailbox emails locally:
+
+```bash
+python scripts/parser_replay.py cache-imap --start-index 0 --limit 1000
+```
+
+Then run the parser analysis offline against the cache:
+
+```bash
+python scripts/parser_replay.py analyze-cache
+```
+
+By default the cache is stored under `data/parser_replay/cache` and the analysis report under `data/parser_replay/reports/parser_replay_report.json`.

@@ -1,0 +1,18 @@
+[Unit]
+Description=Plutonia SearXNG
+After=network.target
+
+[Service]
+Type=simple
+User=python
+Group=python
+WorkingDirectory=/home/python/demos/plutonia/ainews/searxng/src
+Environment=PLUTONIA_ROOT=/home/python/demos/plutonia/ainews
+Environment=SEARXNG_SETTINGS_PATH=/home/python/demos/plutonia/ainews/searxng/settings.yml
+EnvironmentFile=/home/python/demos/plutonia/ainews/.env
+ExecStart=/home/python/demos/plutonia/ainews/searxng/.venv/bin/python -m searx.webapp
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

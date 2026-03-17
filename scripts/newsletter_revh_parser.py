@@ -5,7 +5,9 @@ import json
 import os
 import re
 import unicodedata
-from dataclasses import dataclass
+import urllib.error
+import urllib.request
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from html import unescape
 from typing import Any
@@ -57,10 +59,10 @@ EMAIL_RE = re.compile(r"([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})", re.I)
 URL_RE = re.compile(r'https?://[^\s<>"\']+', re.I)
 URL_IN_ANGLE_RE = re.compile(r"<(https?://[^>\n]+)>")
 FORWARD_HEADER_RE = re.compile(
-    r"(?ims)^(?:_{2,}\s*)?(?:from|de):\s*(?P<from>.+?)\s*$.*?"
-    r"^(?:sent|date|enviado|data):\s*(?P<sent>.+?)\s*$.*?"
-    r"^(?:to|para):\s*(?P<to>.+?)\s*$.*?"
-    r"^(?:subject|assunto):\s*(?P<subject>.+?)\s*$"
+    r"(?ims)^[ \t]*(?:_{2,}\s*)?(?:from|de):\s*(?P<from>.+?)\s*$.*?"
+    r"^[ \t]*(?:sent|date|enviado|data):\s*(?P<sent>.+?)\s*$.*?"
+    r"^[ \t]*(?:to|para):\s*(?P<to>.+?)\s*$.*?"
+    r"^[ \t]*(?:subject|assunto):\s*(?P<subject>.+?)\s*$"
 )
 TITLE_LINK_RE = re.compile(r"(?m)^(?P<title>[^\n<]{4,220}?)\s*<(?P<link>https?://[^>\n]+)>")
 TLDR_ITEM_RE = re.compile(
@@ -70,6 +72,160 @@ TLDR_ITEM_RE = re.compile(
 NUMBERED_ITEM_RE = re.compile(r"(?ms)^\s*(?P<num>\d+)\.\s+(?P<title>[^:\n]{8,220}):\s*(?P<body>.*?)(?=^\s*\d+\.\s+|\Z)")
 QUOTED_LINK_RE = re.compile(r'(?m)^"?(?P<title>[A-Z\[][^\n<]{6,220}?)"?\s*<(?P<link>https?://[^>\n]+)>')
 CURATED_SECTION_RE = re.compile(r"(?ms)^_{10,}\s*\n(?P<title>[^\n]{8,220})\n(?P<body>.*?)(?=^_{10,}\s*$|\Z)")
+TRACKING_PATH_B64_RE = re.compile(r"^[A-Za-z0-9_-]{16,}$")
+FW_PREFIX_RE = re.compile(r"^\s*(?:fw|fwd)\s*:\s*", re.I)
+LINK_TITLE_NOISE_RE = re.compile(
+    r"^(?:read in app|read online|read more|view(?: in browser| online)?|listen online|open in app|"
+    r"sign up|get started|subscribe|watch now|get your guide|check it out|download your guide(?: today)?|"
+    r"tweet screenshot|welcome back!?|privacy policy|terms of service|comments?$|"
+    r"share(?: on [a-z]+)?|image removed by sender\.?)$",
+    re.I,
+)
+SERIES_LINK_RE = re.compile(r"^(?:in\s+)?part\s+\d+\b", re.I)
+LINK_TITLE_NOISE_CONTAINS = (
+    "carlos santos",
+    "advanced analytics & ai",
+    "pluto analytics",
+    "subscribe here",
+    "click here to remain a subscriber",
+    "click here to",
+    "get your guide",
+    "download your guide",
+    "check it out",
+    "tweet screenshot",
+    "claim my free post",
+    "upgrade to paid",
+    "or upgrade your subscription",
+    "watch on x",
+    "watch on youtube",
+    "listen on spotify",
+    "listen on apple",
+    "apple podcasts",
+    "full notes and more episodes",
+    "episode transcript",
+    "work with us",
+    "b2b training",
+    "read louis's perspective",
+    "full story",
+    "available here",
+    "youtube video by",
+    "welcome back!",
+    "you follow",
+    "sponsor",
+    "reach out to me",
+    "any of my socials",
+)
+URL_NOISE_MARKERS = (
+    "stay-subscribed",
+    "submitlike=true",
+    "comments=true",
+    "disable_email",
+    "web-version",
+    "play_audio=true",
+    "podcast-email",
+    "unsubscribe",
+    "privacy",
+    "terms",
+)
+SOCIAL_NOISE_DOMAINS = frozenset({
+    "twitter.com", "x.com", "instagram.com", "facebook.com",
+    "linkedin.com", "youtube.com", "youtu.be", "tiktok.com", "threads.net",
+})
+FAMILY_TITLE_NOISE_EXACT: dict[str, set[str]] = {
+    "substack": {"like", "comment", "restack", "read in app", "spotify", "youtube", "apple podcasts"},
+    "every": {"x", "youtube", "spotify", "apple podcasts", "episode transcript"},
+    "kit": {
+        "master full-stack ai engineering",
+        "master full stack ai engineering",
+        "succeed in ai engineering roles",
+        "open-source",
+        "open source",
+        "hands-on",
+        "hands on",
+        "tutorial",
+        "research",
+    },
+    "beehiiv": {
+        "like", "share", "comment", "follow", "subscribe", "refer",
+        "upgrade", "read online", "view online", "open in browser",
+    },
+    "neuron": {
+        "like", "share", "comment", "follow", "subscribe", "refer",
+        "upgrade", "read online", "view online", "open in browser",
+    },
+}
+FAMILY_TITLE_NOISE_CONTAINS: dict[str, tuple[str, ...]] = {
+    "substack": (
+        "claim my free post",
+        "upgrade to paid",
+        "or upgrade your subscription",
+        "full notes and more episodes",
+        "post voiceover",
+        "subscribe to unlock",
+        "become a paid subscriber",
+        "this post is for paid subscribers",
+        "restacking",
+        "per month or",
+        "per year",
+        "usd per",
+        "pledge your support",
+        "support ai made simple",
+        "upgrade your subscription",
+    ),
+    "every": ("watch on x", "watch on youtube", "listen on spotify", "listen on apple", "episode transcript"),
+    "kit": (
+        "course with",
+        "this course",
+        "you can read more about this here",
+        "you can find the github repo here",
+        "you can find the openpipe art github repo here",
+    ),
+    "beehiiv": (
+        "refer a friend",
+        "share this",
+        "follow us on",
+        "follow on ",
+        "follow me on",
+        "subscribe to ",
+        "check out the newest",
+        "reach out to me",
+        "today's sponsor",
+        "in partnership with",
+        "powered by beehiiv",
+        "upgrade to",
+        "become a member",
+        "advertise with",
+        "advertise in",
+        "partner with",
+        "see all sponsors",
+        "our sponsor",
+    ),
+    "neuron": (
+        "refer a friend",
+        "share this",
+        "follow us on",
+        "follow on ",
+        "follow me on",
+        "check out the newest",
+        "reach out to me",
+        "today's sponsor",
+        "in partnership with",
+        "upgrade to",
+        "become a member",
+        "advertise with",
+        "advertise in",
+        "partner with",
+        "see all sponsors",
+        "our sponsor",
+    ),
+}
+FAMILY_URL_NOISE_MARKERS: dict[str, tuple[str, ...]] = {
+    "substack": ("app-store", "/@", "/subscribe", "/referral", "substack.com/upgrade"),
+    "every": ("/@", "/courses/", "x.com/", "youtu", "spotify.com/", "podcasts.apple.com/"),
+    "kit": ("/membership",),
+    "beehiiv": ("/subscribe", "/upgrade", "/refer", "share=true", "referral="),
+    "neuron": ("/subscribe", "/upgrade", "/refer", "share=true", "referral="),
+}
 
 BOILERPLATE_PATTERNS = [
     "manage your subscriptions",
@@ -108,6 +264,23 @@ PUBLICATION_NAME_HINTS = [
     "artificial intelligence made simple",
 ]
 SKIP_SENDER_DOMAINS = {"github.com", "linkedin.com", "google.com", "notifications.google.com"}
+MATCH_STOPWORDS = {
+    "the",
+    "and",
+    "for",
+    "with",
+    "from",
+    "this",
+    "that",
+    "your",
+    "more",
+    "read",
+    "today",
+    "issue",
+    "newsletter",
+    "episode",
+    "weekly",
+}
 
 
 @dataclass
@@ -120,6 +293,7 @@ class ParsedArticle:
     confidence: float
     notes: list[str]
     family: str
+    images: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -130,6 +304,14 @@ class EmailParseResult:
     skip_notes: list[str]
     best_text: str
     links: list[dict[str, Any]]
+    # Metadados do email (pontos 1-5 do objetivo)
+    received_at: str = ""             # 1 - data de receção pelo padev
+    sender_email: str = ""            # 2 - quem enviou ao padev
+    is_forwarded: bool = False        # 3 - se é reencaminhado
+    original_sent_at: str = ""        # 3 - data do email original
+    original_sender_email: str = ""   # 4 - email do remetente original
+    original_sender_name: str = ""    # 4 - nome do remetente original
+    original_subject: str = ""        # 5 - assunto do email original
 
 
 def _strip_accents(value: str) -> str:
@@ -137,12 +319,22 @@ def _strip_accents(value: str) -> str:
     return "".join(ch for ch in normalized if not unicodedata.combining(ch))
 
 
+_INVISIBLE_CHARS_RE = re.compile(
+    r"[\u00ad\u034f\u200b\u200c\u200d\u200e\u200f\u2028\u2029\u2060\ufeff]+"
+)
+
+
 def clean_text(text: str | None) -> str:
     value = unescape((text or "").replace("\r\n", "\n").replace("\r", "\n"))
     value = value.replace("\u00a0", " ")
+    value = _INVISIBLE_CHARS_RE.sub("", value)
     value = re.sub(r"[ \t]+", " ", value)
     value = re.sub(r"\n{3,}", "\n\n", value)
     return value.strip()
+
+
+def clean_heading(text: str | None) -> str:
+    return re.sub(r"\s+", " ", clean_text(text)).strip()
 
 
 def _normalize_url(url: str | None) -> str:
@@ -168,6 +360,21 @@ def unwrap(url: str | None) -> str:
         if match:
             return unquote(match.group(1))
     parsed = urlparse(value)
+    if parsed.netloc.endswith("substack.com") and parsed.path.startswith("/redirect/2/"):
+        tail = parsed.path.split("/redirect/2/", 1)[-1].split("/", 1)[0]
+        try:
+            raw = tail + "=" * (-len(tail) % 4)
+            decoded = base64.urlsafe_b64decode(raw.encode("ascii")).decode("utf-8", errors="ignore").strip()
+            if decoded.startswith("{"):
+                obj = json.loads(decoded)
+                if isinstance(obj, dict):
+                    for key in ("url", "e"):
+                        if obj.get(key):
+                            return _normalize_url(str(obj[key]))
+            if decoded.startswith(("https://", "http://")):
+                return _normalize_url(decoded)
+        except Exception:
+            pass
     qs = parse_qs(parsed.query)
     for key in ("url", "u", "redirect", "dest", "destination", "next"):
         if key in qs and qs[key]:
@@ -182,6 +389,24 @@ def unwrap(url: str | None) -> str:
                 return _normalize_url(str(obj["url"]))
         except Exception:
             pass
+    for segment in reversed([part for part in parsed.path.split("/") if part]):
+        candidate = segment.rstrip("=")
+        if not TRACKING_PATH_B64_RE.fullmatch(candidate):
+            continue
+        try:
+            raw = candidate + "=" * (-len(candidate) % 4)
+            decoded = base64.urlsafe_b64decode(raw.encode("ascii")).decode("utf-8", errors="ignore").strip()
+        except Exception:
+            continue
+        if decoded.startswith(("https://", "http://")):
+            return _normalize_url(decoded)
+        if decoded.startswith("{") and '"url"' in decoded:
+            try:
+                obj = json.loads(decoded)
+            except Exception:
+                continue
+            if isinstance(obj, dict) and obj.get("url"):
+                return _normalize_url(str(obj["url"]))
     return value
 
 
@@ -191,9 +416,31 @@ def html_to_text(html: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup(["script", "style", "noscript"]):
         tag.decompose()
+    # Remover elementos ocultos usados por email clients para anti-clipping
+    for tag in soup.find_all(style=True):
+        if not tag.attrs:
+            continue
+        style = (tag.get("style") or "").replace(" ", "").lower()
+        if "display:none" in style or "max-height:0" in style or "visibility:hidden" in style or "opacity:0" in style:
+            tag.decompose()
+    # Normalizar whitespace dentro de text nodes: elimina \n de formatação HTML
+    # que causam quebras no meio de frases inline (ex: "An\n Agent Contacted Me").
+    for node in soup.find_all(string=True):
+        if node.parent and node.parent.name in ("script", "style", "pre"):
+            continue
+        normalized = re.sub(r"[ \t\r\n]+", " ", str(node))
+        node.replace_with(normalized)
+    # Após normalizar text nodes, br e block elements são as únicas fontes de \n.
     for br in soup.find_all("br"):
         br.replace_with("\n")
-    return clean_text(soup.get_text("\n", strip=False))
+    _BLOCK = {"p", "div", "h1", "h2", "h3", "h4", "h5", "h6",
+              "li", "tr", "td", "th", "blockquote",
+              "section", "article", "header", "footer", "nav", "aside", "main"}
+    for tag in soup.find_all(_BLOCK):
+        tag.insert_before("\n\n")
+    # Sem separador: espaçamento vem dos text nodes, não do get_text().
+    # Isto evita que tags inline (b, a, span) introduzam \n entre si.
+    return clean_text(soup.get_text(""))
 
 
 def extract_text_links(text: str) -> list[dict[str, Any]]:
@@ -230,6 +477,7 @@ def extract_html_links(html: str) -> list[dict[str, Any]]:
                 "url_original": href,
                 "url_unwrapped": unwrap(href),
                 "anchor_text": clean_text(anchor.get_text(" ", strip=True)) or None,
+                "context_text": _anchor_context_text(anchor) or None,
             }
         )
     return out
@@ -249,6 +497,298 @@ def dedupe_links(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         item["domain"] = (urlparse(url).netloc or "").lower()
         out.append(item)
     return out
+
+
+def _anchor_context_text(anchor) -> str:
+    direct = clean_text(anchor.get_text(" ", strip=True))
+    if direct and len(re.findall(r"[A-Za-z0-9]+", direct)) >= 2 and not LINK_TITLE_NOISE_RE.match(direct):
+        return direct[:500]
+
+    img = anchor.find("img")
+    if img is not None:
+        alt = clean_text(str(img.get("alt", "")))
+        if alt and len(re.findall(r"[A-Za-z0-9]+", alt)) >= 2 and not LINK_TITLE_NOISE_RE.match(alt):
+            return alt[:500]
+    return direct[:500]
+
+
+def _strip_forward_prefix(text: str | None) -> str:
+    value = clean_heading(text)
+    previous = None
+    while value and value != previous:
+        previous = value
+        value = FW_PREFIX_RE.sub("", value).strip()
+    return value
+
+
+def _is_sparse_heading(text: str | None) -> bool:
+    value = clean_heading(text)
+    return len(re.findall(r"[A-Za-z0-9]{2,}", value)) < 2
+
+
+def _resolved_subject_hint(context: dict[str, Any], meta: dict[str, Any]) -> str:
+    candidates = [
+        meta.get("original_subject"),
+        context.get("headers_parsed", {}).get("subject"),
+    ]
+    for candidate in candidates:
+        subject = _strip_forward_prefix(candidate)
+        if subject and not _is_sparse_heading(subject):
+            return subject
+    return _strip_forward_prefix(candidates[0] or candidates[1] or "")
+
+
+def _token_set(text: str | None) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[A-Za-z0-9]{2,}", _strip_accents(clean_text(text).lower()))
+        if token not in MATCH_STOPWORDS
+    }
+
+
+def _title_match_score(title: str, target: str) -> int:
+    title_clean = clean_heading(title)
+    target_clean = clean_heading(target)
+    if not title_clean or not target_clean:
+        return 0
+    title_low = _strip_accents(title_clean).lower()
+    target_low = _strip_accents(target_clean).lower()
+    if title_low == target_low:
+        return 12
+    if title_low in target_low or target_low in title_low:
+        return 8
+    title_tokens = _token_set(title_clean)
+    target_tokens = _token_set(target_clean)
+    if not title_tokens or not target_tokens:
+        return 0
+    overlap = title_tokens & target_tokens
+    if not overlap:
+        return 0
+    score = len(overlap) * 2
+    if len(overlap) >= max(2, min(len(title_tokens), len(target_tokens)) // 2):
+        score += 4
+    return score
+
+
+def _looks_like_link_title_noise(text: str, *, subject_hint: str = "", allow_subject_match: bool = False) -> bool:
+    value = clean_heading(text)
+    if not value:
+        return True
+    if len(re.findall(r"[A-Za-z0-9]+", value)) < 2:
+        return True
+    if LINK_TITLE_NOISE_RE.match(value):
+        return True
+    if is_boilerplate(value):
+        return True
+    low = value.lower()
+    flat = re.sub(r"\s+", " ", low).strip()
+    if any(marker in flat for marker in LINK_TITLE_NOISE_CONTAINS):
+        return True
+    if SERIES_LINK_RE.match(value):
+        return True
+    if any(flat.startswith(prefix) for prefix in ("advertise to ", "partner with us", "sponsored by", "in partnership with")):
+        return True
+    if flat in {"preview", "sponsor", "today's issue", "in today's newsletter:", "full list here", "opt in/out", "opt in / out"}:
+        return True
+    if re.fullmatch(r"[\w.-]+\.(io|com|net|org|co)", flat):
+        return True
+    if subject_hint and not allow_subject_match and flat == clean_heading(subject_hint).lower():
+        return True
+    return False
+
+
+def _title_from_context_text(value: str) -> str:
+    text = clean_text(value)
+    if not text:
+        return ""
+    first_line = clean_text(text.splitlines()[0])
+    sentence = clean_text(re.split(r"(?<=[.!?])\s+", first_line, maxsplit=1)[0])
+    candidate = sentence or first_line
+    return candidate[:220]
+
+
+def _title_from_link_row(row: dict[str, Any], *, subject_hint: str = "", allow_subject_match: bool = False) -> str:
+    anchor_text = clean_heading(row.get("anchor_text") or "")
+    if anchor_text.startswith(("http://", "https://")):
+        anchor_text = ""
+    if anchor_text and not _looks_like_link_title_noise(anchor_text, subject_hint=subject_hint, allow_subject_match=allow_subject_match):
+        return anchor_text
+    context_text = clean_text(row.get("context_text") or "")
+    title = _title_from_context_text(context_text)
+    if title.startswith(("http://", "https://")):
+        return ""
+    return title
+
+
+def _looks_like_link_candidate_noise(
+    title: str,
+    url: str,
+    family: str,
+    *,
+    context_text: str = "",
+    subject_hint: str = "",
+    allow_subject_match: bool = False,
+) -> bool:
+    if not url.startswith(("http://", "https://")):
+        return True
+    if _looks_like_link_title_noise(title, subject_hint=subject_hint, allow_subject_match=allow_subject_match):
+        return True
+    low_title = clean_heading(title).lower()
+    low_context = re.sub(r"\s+", " ", clean_text(context_text).lower()).strip()
+    low_url = url.lower()
+    if any(marker in low_url for marker in URL_NOISE_MARKERS):
+        return True
+    if low_title in FAMILY_TITLE_NOISE_EXACT.get(family, set()):
+        return True
+    if any(marker in low_title for marker in FAMILY_TITLE_NOISE_CONTAINS.get(family, ())):
+        return True
+    if any(marker in low_context for marker in FAMILY_TITLE_NOISE_CONTAINS.get(family, ())):
+        return True
+    if any(marker in low_url for marker in FAMILY_URL_NOISE_MARKERS.get(family, ())):
+        return True
+    if "sponsor" in low_title or "sponsor" in low_context or "utm_medium=sponsored" in low_url:
+        return True
+    if family in {"beehiiv", "neuron"}:
+        parsed_netloc = urlparse(url).netloc.lstrip("www.")
+        if parsed_netloc in SOCIAL_NOISE_DOMAINS:
+            return True
+    if family == "substack" and _title_match_score(title, subject_hint) == 0:
+        if re.fullmatch(r"[A-Z][\w'.-]+(?: [A-Z][\w'.-]+){1,2}", clean_heading(title)):
+            return True
+    return False
+
+
+def _iter_scored_link_candidates(
+    context: dict[str, Any],
+    meta: dict[str, Any],
+    family: str,
+    *,
+    match_hint: str = "",
+    allow_subject_match: bool = False,
+) -> list[dict[str, Any]]:
+    subject_hint = clean_heading(match_hint or _resolved_subject_hint(context, meta))
+    out: list[dict[str, Any]] = []
+    for idx, row in enumerate(context.get("links", [])):
+        url = clean_text(row.get("url_unwrapped") or row.get("url_original") or "")
+        context_text = clean_text(row.get("context_text") or "")
+        title = _title_from_link_row(row, subject_hint=subject_hint, allow_subject_match=allow_subject_match)
+        if not title:
+            continue
+        if _looks_like_link_candidate_noise(
+            title,
+            url,
+            family,
+            context_text=context_text,
+            subject_hint=subject_hint,
+            allow_subject_match=allow_subject_match,
+        ):
+            continue
+        score = _title_match_score(title, subject_hint)
+        if context_text and len(context_text) >= 80:
+            score += 2
+        if len(title) >= 24:
+            score += 1
+        low_url = url.lower()
+        if family == "substack" and ("substack.com/app-link/post" in low_url or "open.substack.com/" in low_url or "substack.com/redirect/" in low_url):
+            score += 2
+        elif family == "every" and "every.to/" in low_url:
+            score += 2
+        elif family == "kit" and "dailydoseofds.com" in low_url:
+            score += 2
+        out.append(
+            {
+                "title": title,
+                "body": context_text if len(context_text) > len(title) + 20 else title,
+                "url": url,
+                "score": score,
+                "order": idx,
+            }
+        )
+    return out
+
+
+def _best_link_candidate(
+    context: dict[str, Any],
+    meta: dict[str, Any],
+    family: str,
+    match_hint: str,
+) -> dict[str, Any] | None:
+    rows = _iter_scored_link_candidates(context, meta, family, match_hint=match_hint, allow_subject_match=True)
+    if not rows:
+        return None
+    rows.sort(key=lambda item: (item["score"], -item["order"]), reverse=True)
+    return rows[0]
+
+
+def _extract_kit_issue_titles(forward_body: str) -> list[str]:
+    titles: list[str] = []
+    seen: set[str] = set()
+    lines = [clean_heading(line) for line in forward_body.splitlines()]
+    capture = False
+    for line in lines:
+        low = line.lower()
+        if not capture:
+            if low in {"in today's newsletter:", "in today’s newsletter:"}:
+                capture = True
+            continue
+        if not line or line in {"·", "•", "-", "*"}:
+            continue
+        if low in {"today's issue", "today’s issue"}:
+            break
+        if low in {"open-source", "open source", "hands-on", "hands on", "tutorial", "research"}:
+            continue
+        if is_boilerplate(line):
+            break
+        if _looks_like_link_title_noise(line, allow_subject_match=True):
+            continue
+        key = line.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        titles.append(line)
+        if len(titles) >= 6:
+            break
+    return titles
+
+
+def _extract_link_digest_items(
+    context: dict[str, Any],
+    meta: dict[str, Any],
+    family: str,
+    *,
+    max_items: int = 8,
+) -> list[ParsedArticle]:
+    by_url: dict[str, dict[str, Any]] = {}
+
+    for row in _iter_scored_link_candidates(context, meta, family, allow_subject_match=True):
+        url = row["url"]
+        current = by_url.get(url)
+        if current is None or row["score"] > current["score"]:
+            by_url[url] = dict(row)
+
+    rows = sorted(by_url.values(), key=lambda item: item["order"])
+    articles: list[ParsedArticle] = []
+    seen_titles: set[str] = set()
+    for row in rows:
+        title = clean_heading(row["title"])
+        if title.casefold() in seen_titles:
+            continue
+        seen_titles.add(title.casefold())
+        articles.append(
+            _make_article(
+                context,
+                meta,
+                title,
+                row["body"],
+                row["url"],
+                family,
+                0.76,
+                ["link_digest_fallback"],
+            )
+        )
+        if len(articles) >= max_items:
+            break
+    return articles
 
 
 def _safe_iso(year: int, month: int, day: int, hour: int = 0, minute: int = 0, second: int = 0) -> str:
@@ -347,6 +887,36 @@ def choose_published_date(context: dict[str, Any], text: str | None = None, link
 def is_boilerplate(text: str) -> bool:
     hay = clean_text(text).lower()
     return any(marker in hay for marker in BOILERPLATE_PATTERNS)
+
+
+def _extract_html_heading(raw_html: str, *, skip: str = "") -> str:
+    """Extrai o primeiro H1/H2/H3 significativo do HTML, ignorando boilerplate.
+
+    Se `skip` for fornecido, ignora headings que coincidam com esse texto
+    (case/accent-insensitive) e continua para o seguinte.
+    """
+    if not raw_html:
+        return ""
+    skip_norm = _strip_accents(skip.casefold()) if skip else ""
+    soup = BeautifulSoup(raw_html, "html.parser")
+    for level in ("h1", "h2", "h3"):
+        for tag in soup.find_all(level):
+            text = clean_heading(tag.get_text(" ", strip=True))
+            if not text or len(text) < 6:
+                continue
+            if len(re.findall(r"[A-Za-z0-9]+", text)) < 2:
+                continue
+            if is_boilerplate(text):
+                continue
+            if LINK_TITLE_NOISE_RE.match(text):
+                continue
+            low = text.lower()
+            if any(low == hint.lower() for hint in PUBLICATION_NAME_HINTS):
+                continue
+            if skip_norm and _strip_accents(text.casefold()) == skip_norm:
+                continue
+            return text
+    return ""
 
 
 def find_first_link(text: str) -> str:
@@ -505,16 +1075,41 @@ def family_for(context: dict[str, Any], meta: dict[str, Any], forward_body: str)
 def trim_footer(text: str) -> str:
     lines = [line.rstrip() for line in clean_text(text).splitlines()]
     out: list[str] = []
+    content_chars = 0
     for line in lines:
-        if is_boilerplate(line):
+        # Só corta boilerplate depois de haver conteúdo real acumulado.
+        # Isto evita que banners de topo (ex: "Forwarded this email? Subscribe here")
+        # sejam confundidos com footers quando aparecem como primeira linha.
+        if content_chars >= 300 and is_boilerplate(line):
             break
         if re.match(r"^\[[^\]]+\]$", line):
             continue
         out.append(line)
+        content_chars += len(line.strip())
     return clean_text("\n".join(out))
 
 
-def should_skip_email(context: dict[str, Any], meta: dict[str, Any], family: str, forward_body: str) -> tuple[bool, list[str]]:
+_BOUNCE_SUBJECT_PREFIXES = (
+    "não entregue:",
+    "nao entregue:",
+    "undeliverable:",
+    "delivery status notification",
+    "mail delivery failed",
+    "mail delivery failure",
+    "returned mail:",
+    "failure notice",
+)
+
+_BOUNCE_SENDER_PREFIXES = (
+    "postmaster@",
+    "mailer-daemon@",
+    "mail-daemon@",
+    "delivery@",
+    "noreply+bounce@",
+)
+
+
+def should_skip_email(context: dict[str, Any], meta: dict[str, Any], family: str, forward_body: str, *, raw_html: str = "") -> tuple[bool, list[str]]:
     notes: list[str] = []
     top_sender = (meta.get("top_sender_email") or "").lower()
     original_sender = (meta.get("original_sender_email") or "").lower()
@@ -522,6 +1117,13 @@ def should_skip_email(context: dict[str, Any], meta: dict[str, Any], family: str
     original_subject = clean_text(meta.get("original_subject") or "").lower()
     has_forward = bool(context.get("signals", {}).get("forward_blocks"))
     sender_domain = (original_sender or top_sender).split("@")[-1] if (original_sender or top_sender) else ""
+
+    # --- bounce / NDR ---
+    _any_sender = original_sender or top_sender
+    if any(original_subject.startswith(p) for p in _BOUNCE_SUBJECT_PREFIXES):
+        return True, ["bounce_ndr"]
+    if any(_any_sender.startswith(p) for p in _BOUNCE_SENDER_PREFIXES):
+        return True, ["bounce_ndr"]
 
     if top_sender and not has_forward and top_sender not in _forwarder_emails() and family == "generic":
         notes.append("not_forwarded_newsletter")
@@ -540,6 +1142,10 @@ def should_skip_email(context: dict[str, Any], meta: dict[str, Any], family: str
     if "security alert" in body_low and not has_forward:
         return True, ["security_alert"]
 
+    # --- email clipped pelo cliente de mail (Gmail) ---
+    if raw_html and ("[message clipped]" in raw_html.lower() or "view entire message" in raw_html.lower()):
+        return True, ["email_clipped"]
+
     looks_like_substack_notification = (
         "substack" in sender_domain
         or "substack" in original_sender_raw
@@ -550,6 +1156,9 @@ def should_skip_email(context: dict[str, Any], meta: dict[str, Any], family: str
             return True, ["substack_live_notification"]
         if " recommended " in f" {original_subject} " and ("subscribe to" in body_low or "explore what" in body_low):
             return True, ["substack_recommendation_notification"]
+        # Substack "Your Weekly Stack" — digest curado sem links de artigos reais
+        if "your weekly stack" in body_low:
+            return True, ["substack_weekly_stack"]
 
     return False, notes
 
@@ -566,7 +1175,7 @@ def _make_article(
 ) -> ParsedArticle:
     published_date, date_source = choose_published_date(context, text=text, link=link)
     return ParsedArticle(
-        title=clean_text(title or ""),
+        title=clean_heading(title or ""),
         text=trim_footer(text or ""),
         source_link=unwrap(link),
         published_date=published_date,
@@ -578,6 +1187,7 @@ def _make_article(
 
 
 def extract_tldr(forward_body: str, context: dict[str, Any], meta: dict[str, Any]) -> list[ParsedArticle]:
+    subject_hint = _resolved_subject_hint(context, meta)
     articles: list[ParsedArticle] = []
     for match in TLDR_ITEM_RE.finditer(forward_body):
         title = clean_text(match.group("title"))
@@ -590,13 +1200,17 @@ def extract_tldr(forward_body: str, context: dict[str, Any], meta: dict[str, Any
         articles.append(_make_article(context, meta, title, body, match.group("link"), "tldr", 0.90, notes))
     if articles:
         return articles
-    return [_make_article(context, meta, meta.get("original_subject"), forward_body, None, "tldr", 0.55, ["tldr_fallback"])]
+    link_articles = _extract_link_digest_items(context, meta, "tldr", max_items=5)
+    if len(link_articles) >= 2:
+        return link_articles
+    return [_make_article(context, meta, subject_hint or meta.get("original_subject"), forward_body, None, "tldr", 0.55, ["tldr_fallback"])]
 
 
-def find_best_substack_title(forward_body: str, meta: dict[str, Any]) -> tuple[str | None, str | None]:
-    original_subject = clean_text(meta.get("original_subject") or "")
-    if original_subject.lower().startswith("fw:"):
-        original_subject = clean_text(original_subject[3:])
+def find_best_substack_title(forward_body: str, context: dict[str, Any], meta: dict[str, Any]) -> tuple[str | None, str | None]:
+    original_subject = _resolved_subject_hint(context, meta)
+    best_link = _best_link_candidate(context, meta, "substack", original_subject)
+    if best_link:
+        return best_link["title"], best_link["url"]
     candidates: list[tuple[int, str, str]] = []
     for match in TITLE_LINK_RE.finditer(forward_body):
         title = clean_text(match.group("title"))
@@ -627,7 +1241,8 @@ def find_best_substack_title(forward_body: str, meta: dict[str, Any]) -> tuple[s
 
 
 def extract_substack(forward_body: str, context: dict[str, Any], meta: dict[str, Any]) -> list[ParsedArticle]:
-    title, link = find_best_substack_title(forward_body, meta)
+    subject_hint = _resolved_subject_hint(context, meta)
+    title, link = find_best_substack_title(forward_body, context, meta)
     body = trim_footer(forward_body)
     if link and title:
         anchor = f"{title}<{link}>"
@@ -638,12 +1253,15 @@ def extract_substack(forward_body: str, context: dict[str, Any], meta: dict[str,
         match = TITLE_LINK_RE.search(body)
         if match:
             maybe_title = clean_text(match.group("title"))
-            looks_like_author = maybe_title.count(" ") < 2 and maybe_title.lower() != clean_text(meta.get("original_subject") or "").lower()
+            looks_like_author = maybe_title.count(" ") < 2 and maybe_title.lower() != subject_hint.lower()
             if maybe_title and not looks_like_author and not any(hint in maybe_title.lower() for hint in PUBLICATION_NAME_HINTS):
                 title = maybe_title
                 link = match.group("link")
                 body = body[match.end():].strip()
-    return [_make_article(context, meta, title, body, link, "substack", 0.87, [])]
+    digest_articles = _extract_link_digest_items(context, meta, "substack", max_items=6)
+    if len(digest_articles) >= 3:
+        return digest_articles
+    return [_make_article(context, meta, title or subject_hint, body, link, "substack", 0.87, [])]
 
 
 def extract_mailchimp(forward_body: str, context: dict[str, Any], meta: dict[str, Any]) -> list[ParsedArticle]:
@@ -697,7 +1315,97 @@ def extract_numbered_beehiiv(forward_body: str, context: dict[str, Any], meta: d
     return articles
 
 
-def extract_beehiiv(forward_body: str, context: dict[str, Any], meta: dict[str, Any], family: str) -> list[ParsedArticle]:
+_ARROW_CHARS = frozenset({"→", "->", "»", "▶"})
+
+
+def _extract_beehiiv_paragraph_items(
+    raw_html: str,
+    context: dict[str, Any],
+    meta: dict[str, Any],
+    family: str,
+) -> list[ParsedArticle]:
+    """Extrai artigos do padrão 'um <p> por artigo' usado em digests beehiiv/neuron.
+
+    Padrão detectado:
+      [emoji] <b><i>Título completo</i></b> [→] descrição
+
+    O título é tudo o que está antes do separador '→' no texto do parágrafo,
+    com o prefixo de emoji/símbolo removido. Isto captura tanto o texto das
+    âncoras como o texto bold adjacente fora delas.
+
+    Discriminador chave: presença de '→' no texto do parágrafo — ausente nos
+    parágrafos editoriais e nos blocos de Thought Loop.
+    """
+    if not raw_html:
+        return []
+
+    soup = BeautifulSoup(raw_html, "html.parser")
+    subject_hint = _resolved_subject_hint(context, meta)
+    articles: list[ParsedArticle] = []
+    seen_urls: set[str] = set()
+
+    for p in soup.find_all("p"):
+        p_text = p.get_text(" ", strip=True)
+
+        # Parágrafo deve conter seta → como separador título/descrição
+        arrow_pos = -1
+        for arrow in _ARROW_CHARS:
+            pos = p_text.find(arrow)
+            if pos > 0 and (arrow_pos < 0 or pos < arrow_pos):
+                arrow_pos = pos
+        if arrow_pos < 0:
+            continue
+
+        # Deve ter pelo menos um link HTTP
+        links = [a for a in p.find_all("a", href=True) if a.get("href", "").startswith("http")]
+        if not links:
+            continue
+
+        first_url = links[0].get("href", "")
+
+        # Título = tudo antes do → (strip de prefixo emoji/não-alfanumérico)
+        title_raw = p_text[:arrow_pos].strip()
+        # Remove prefixo de emoji e símbolos não-alfanuméricos
+        title = re.sub(r"^[^\w\"'(]+", "", title_raw).strip()
+        title = clean_heading(title)
+
+        # Descrição = tudo depois do →
+        desc = clean_text(p_text[arrow_pos + 1:].strip())
+        if not desc:
+            desc = clean_text(p_text)
+
+        # Filtros de ruído
+        if len(title) < 8 or is_boilerplate(title):
+            continue
+        if _looks_like_link_title_noise(title, subject_hint=subject_hint):
+            continue
+        if any(m in title.lower() for m in FAMILY_TITLE_NOISE_CONTAINS.get(family, ())):
+            continue
+        if any(m in first_url.lower() for m in FAMILY_URL_NOISE_MARKERS.get(family, ())):
+            continue
+        if any(m in first_url.lower() for m in URL_NOISE_MARKERS):
+            continue
+
+        # Deduplicação por URL
+        if first_url in seen_urls:
+            continue
+        seen_urls.add(first_url)
+
+        articles.append(
+            _make_article(context, meta, title, desc, first_url, family, 0.82, ["para_digest"])
+        )
+
+    return articles
+
+
+def extract_beehiiv(forward_body: str, context: dict[str, Any], meta: dict[str, Any], family: str, *, raw_html: str = "") -> list[ParsedArticle]:
+    # Tenta primeiro o padrão estrutural HTML (um parágrafo por artigo com seta →)
+    if raw_html:
+        para_articles = _extract_beehiiv_paragraph_items(raw_html, context, meta, family)
+        if len(para_articles) >= 3:
+            return para_articles
+
+    subject_hint = _resolved_subject_hint(context, meta)
     articles = extract_numbered_beehiiv(forward_body, context, meta, family)
     if articles:
         return articles
@@ -706,10 +1414,10 @@ def extract_beehiiv(forward_body: str, context: dict[str, Any], meta: dict[str, 
         title = clean_text(match.group("title"))
         if is_boilerplate(title) or len(title) < 8:
             continue
-        lower = title.lower()
-        if lower.startswith("march ") or lower.startswith("welcome") or lower in {"sign up", "advertise", "read online", "listen online"}:
+        if _looks_like_link_title_noise(title, subject_hint=subject_hint):
             continue
-        if lower.startswith("in partnership with"):
+        lower = title.lower()
+        if any(marker in lower for marker in FAMILY_TITLE_NOISE_CONTAINS.get(family, ())):
             continue
         matches.append(match)
     if matches:
@@ -724,25 +1432,27 @@ def extract_beehiiv(forward_body: str, context: dict[str, Any], meta: dict[str, 
         if "in today's email" in forward_body.lower() or "here's what happened in ai today" in forward_body.lower():
             notes.append("digest_not_fully_split")
         return [_make_article(context, meta, title, body, link, family, 0.74, notes)]
+    link_articles = _extract_link_digest_items(context, meta, family, max_items=5)
+    if len(link_articles) >= 2:
+        return link_articles
     fallback_notes = [f"{family}_fallback"]
     if family in {"beehiiv", "neuron"} and (
         "in today's email" in forward_body.lower() or "here's what happened in ai today" in forward_body.lower()
     ):
         fallback_notes.append("digest_not_fully_split")
-    return [_make_article(context, meta, meta.get("original_subject"), forward_body, None, family, 0.60, fallback_notes)]
+    return [_make_article(context, meta, subject_hint or meta.get("original_subject"), forward_body, None, family, 0.60, fallback_notes)]
 
 
 def extract_every(forward_body: str, context: dict[str, Any], meta: dict[str, Any]) -> list[ParsedArticle]:
     articles: list[ParsedArticle] = []
-    title = meta.get("original_subject")
+    subject_hint = _resolved_subject_hint(context, meta)
+    title = subject_hint or meta.get("original_subject")
     main_link = ""
     main_body = forward_body
-    if title:
-        escaped_title = re.escape(str(title))
-        match = re.search(rf"(?m)^{escaped_title}\s*<(?P<link>https?://[^>\n]+)>", forward_body)
-        if match:
-            main_link = match.group("link")
-            main_body = forward_body[match.end():]
+    best_link = _best_link_candidate(context, meta, "every", title or "")
+    if best_link:
+        title = best_link["title"]
+        main_link = best_link["url"]
     for marker in ("Knowledge base", "You received this email because", "No longer interested", "221 Canal St"):
         pos = main_body.find(marker)
         if pos > 0:
@@ -763,40 +1473,40 @@ def extract_every(forward_body: str, context: dict[str, Any], meta: dict[str, An
 
 
 def extract_kit(forward_body: str, context: dict[str, Any], meta: dict[str, Any]) -> list[ParsedArticle]:
-    articles: list[ParsedArticle] = []
-    title_links = []
-    for match in TITLE_LINK_RE.finditer(forward_body):
-        title = clean_text(match.group("title")).lstrip("*- ")
-        lower = title.lower()
-        if len(title) < 8 or is_boilerplate(title):
-            continue
-        if lower in {"today's issue", "in today's newsletter:"}:
-            continue
-        title_links.append(match)
-    seen_titles: set[str] = set()
-    idx = 1
-    for match in title_links:
-        title = clean_text(match.group("title")).lstrip("*- ")
-        lower = title.lower()
-        if any(lower.startswith(prefix) for prefix in ("master full-stack", "advertise to 950k+", "partner with us")):
-            continue
-        if lower in seen_titles:
-            continue
-        start = match.end()
-        next_match = next((row for row in title_links if row.start() > start), None)
-        body = forward_body[start: next_match.start() if next_match else len(forward_body)]
-        if "open-source" in body[:40].lower() or "hands-on" in body[:40].lower():
-            body = re.sub(r"(?mi)^(open-source|hands-on|tutorial|research)\s*$", "", body).strip()
-        seen_titles.add(lower)
-        confidence = 0.84 if idx <= 3 else 0.70
-        notes: list[str] = []
-        if idx > 3:
-            notes.append("late_section_item")
-        articles.append(_make_article(context, meta, title, body, match.group("link"), "kit", confidence, notes))
-        idx += 1
-    if articles:
-        return articles
-    return [_make_article(context, meta, meta.get("original_subject"), forward_body, None, "kit", 0.55, ["kit_fallback"])]
+    subject_hint = _resolved_subject_hint(context, meta)
+    issue_titles = _extract_kit_issue_titles(forward_body)
+    if issue_titles:
+        primary_title = max(issue_titles, key=lambda item: _title_match_score(item, subject_hint)) if subject_hint else issue_titles[0]
+        articles: list[ParsedArticle] = []
+        seen_titles: set[str] = set()
+        for title in issue_titles:
+            key = title.casefold()
+            if key in seen_titles:
+                continue
+            seen_titles.add(key)
+            best_link = _best_link_candidate(context, meta, "kit", title)
+            body = forward_body if title == primary_title else (best_link["body"] if best_link and best_link.get("body") else title)
+            notes: list[str] = ["kit_issue_list"]
+            if title != primary_title:
+                notes.append("summary_only")
+            articles.append(
+                _make_article(
+                    context,
+                    meta,
+                    title,
+                    body,
+                    best_link["url"] if best_link else None,
+                    "kit",
+                    0.82 if title == primary_title else 0.72,
+                    notes,
+                )
+            )
+        if articles:
+            return articles
+    best_link = _best_link_candidate(context, meta, "kit", subject_hint)
+    if best_link:
+        return [_make_article(context, meta, best_link["title"], forward_body, best_link["url"], "kit", 0.70, ["kit_link_fallback"])]
+    return [_make_article(context, meta, subject_hint or meta.get("original_subject"), forward_body, None, "kit", 0.55, ["kit_fallback"])]
 
 
 def extract_curated(forward_body: str, context: dict[str, Any], meta: dict[str, Any]) -> list[ParsedArticle]:
@@ -834,6 +1544,48 @@ def extract_generic(forward_body: str, context: dict[str, Any], meta: dict[str, 
     return [_make_article(context, meta, meta.get("original_subject"), forward_body, None, "generic", 0.45, ["generic_fallback"])]
 
 
+# ---------------------------------------------------------------------------
+# Image enrichment (ponto 6.4) — busca og:image/twitter:image do source link
+# ---------------------------------------------------------------------------
+
+_OG_IMAGE_PROPS = ("og:image", "og:image:secure_url", "twitter:image")
+_FETCH_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; plutonia-bot/1.0; +https://plutoanalytics.com)",
+    "Accept": "text/html,application/xhtml+xml",
+}
+
+
+def fetch_og_images(url: str, *, timeout: float = 6.0) -> list[str]:
+    """Devolve URLs de imagem OG/Twitter encontradas no source link. Falha silenciosamente."""
+    if not url or not url.startswith(("http://", "https://")):
+        return []
+    try:
+        req = urllib.request.Request(url, headers=_FETCH_HEADERS)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            charset = resp.headers.get_content_charset("utf-8") or "utf-8"
+            html = resp.read(300_000).decode(charset, errors="replace")
+    except Exception:
+        return []
+    soup = BeautifulSoup(html, "html.parser")
+    images: list[str] = []
+    seen: set[str] = set()
+    for prop in _OG_IMAGE_PROPS:
+        meta = soup.find("meta", property=prop) or soup.find("meta", attrs={"name": prop})
+        if meta:
+            img = str(meta.get("content", "")).strip()
+            if img and img not in seen:
+                seen.add(img)
+                images.append(img)
+    return images
+
+
+def enrich_with_images(result: EmailParseResult, *, timeout: float = 6.0) -> None:
+    """Preenche article.images in-place para todos os artigos com source_link."""
+    for article in result.articles:
+        if article.source_link and not article.images:
+            article.images = fetch_og_images(article.source_link, timeout=timeout)
+
+
 def _build_context(raw_html: str, email_meta: dict[str, Any]) -> dict[str, Any]:
     html_text = html_to_text(raw_html)
     links = dedupe_links(extract_html_links(raw_html) + extract_text_links(html_text))
@@ -865,9 +1617,31 @@ def parse_email_articles(raw_html: str, email_meta: dict[str, Any] | None = None
     best_text = str(context.get("bodies", {}).get("best_text", ""))
     meta, forward_body = split_forward_meta(best_text, context)
     family = family_for(context, meta, forward_body)
-    skipped, skip_notes = should_skip_email(context, meta, family, forward_body)
+    skipped, skip_notes = should_skip_email(context, meta, family, forward_body, raw_html=raw_html)
+
+    # --- metadados do email (pontos 1-5) ---
+    received_at = clean_text(meta_in.get("received_at") or "")
+    sender_email = clean_text(meta_in.get("sender_email") or "").lower()
+    is_forwarded = bool(context.get("signals", {}).get("forward_blocks"))
+    original_sent_at = clean_text(meta.get("original_sent_raw") or meta_in.get("original_sent_at") or "")
+    original_sender_email = clean_text(meta.get("original_sender_email") or "").lower()
+    _sender_raw = clean_text(meta.get("original_sender_raw") or meta_in.get("original_sender_name") or "")
+    original_sender_name = _sender_raw[:_sender_raw.index("<")].strip() if "<" in _sender_raw else _sender_raw
+    original_subject = clean_text(meta.get("original_subject") or meta_in.get("subject") or "")
+
+    _email_kwargs: dict[str, Any] = dict(
+        received_at=received_at,
+        sender_email=sender_email,
+        is_forwarded=is_forwarded,
+        original_sent_at=original_sent_at,
+        original_sender_email=original_sender_email,
+        original_sender_name=original_sender_name,
+        original_subject=original_subject,
+    )
+
     if skipped:
-        return EmailParseResult([], family, True, skip_notes, best_text, context.get("links", []))
+        return EmailParseResult([], family, True, skip_notes, best_text, context.get("links", []), **_email_kwargs)
+
     if family == "tldr":
         articles = extract_tldr(forward_body, context, meta)
     elif family == "substack":
@@ -877,9 +1651,9 @@ def parse_email_articles(raw_html: str, email_meta: dict[str, Any] | None = None
     elif family == "tds":
         articles = extract_tds(forward_body, context, meta)
     elif family == "beehiiv":
-        articles = extract_beehiiv(forward_body, context, meta, family="beehiiv")
+        articles = extract_beehiiv(forward_body, context, meta, family="beehiiv", raw_html=raw_html)
     elif family == "neuron":
-        articles = extract_beehiiv(forward_body, context, meta, family="neuron")
+        articles = extract_beehiiv(forward_body, context, meta, family="neuron", raw_html=raw_html)
     elif family == "every":
         articles = extract_every(forward_body, context, meta)
     elif family == "kit":
@@ -888,5 +1662,15 @@ def parse_email_articles(raw_html: str, email_meta: dict[str, Any] | None = None
         articles = extract_curated(forward_body, context, meta)
     else:
         articles = extract_generic(forward_body, context, meta)
+
     cleaned_articles = [article for article in articles if article.title or article.text]
-    return EmailParseResult(cleaned_articles, family, False, [], best_text, context.get("links", []))
+
+    # Fix 3 — se o único artigo usa o subject como título, tenta extrair o H1/H2/H3 real do HTML
+    if len(cleaned_articles) == 1 and original_subject:
+        article = cleaned_articles[0]
+        if _strip_accents(article.title.casefold()) == _strip_accents(original_subject.casefold()):
+            heading = _extract_html_heading(raw_html, skip=original_subject)
+            if heading:
+                article.title = heading
+
+    return EmailParseResult(cleaned_articles, family, False, [], best_text, context.get("links", []), **_email_kwargs)

@@ -361,7 +361,8 @@ def publish_articles(request):
             category_objects = _resolve_category_objects(article_data.get("categories", []))
 
             published_at = default_published_at
-            published_raw = str(article_data.get("published_at", "")).strip()
+            source_published_raw = str(article_data.get("source_published_at", "")).strip()
+            published_raw = source_published_raw or str(article_data.get("published_at", "")).strip()
             if published_raw:
                 parsed = parse_datetime(published_raw)
                 if parsed is not None:

@@ -7,10 +7,10 @@ Requires=plutonia-portal.service
 Type=simple
 User=python
 Group=python
-WorkingDirectory=/home/python/demos/plutonia/ainews
-Environment=PLUTONIA_ROOT=/home/python/demos/plutonia/ainews
-EnvironmentFile=/home/python/demos/plutonia/ainews/.env
-ExecStart=/home/python/demos/plutonia/ainews/scripts/run_monitor.sh
+WorkingDirectory=/home/python/demos/plutonia_v3
+Environment=PLUTONIA_ROOT=/home/python/demos/plutonia_v3
+EnvironmentFile=/home/python/demos/plutonia_v3/.env
+ExecStart=/home/python/demos/plutonia_v3/scripts/run_monitor.sh
 Restart=always
 RestartSec=5
 

@@ -118,6 +118,7 @@ def _save_email(uid: str, raw_html: str, result) -> Path:
                 "article_id": f"{uid}_{idx}",
                 "title": article.title,
                 "source_link": article.source_link,
+                "source_link_final": article.source_link_final,
                 "published_date": article.published_date,
                 "published_date_source": article.published_date_source,
                 "confidence": round(article.confidence, 3),

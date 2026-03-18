@@ -293,6 +293,7 @@ class ParsedArticle:
     confidence: float
     notes: list[str]
     family: str
+    source_link_final: bool = True  # False = placeholder à espera de link definitivo do utilizador
     images: list[str] = field(default_factory=list)
 
 
@@ -1288,7 +1289,12 @@ def extract_substack(forward_body: str, context: dict[str, Any], meta: dict[str,
         digest_articles = _extract_link_digest_items(context, meta, "substack", max_items=6)
         if len(digest_articles) >= 3:
             return digest_articles
-    return [_make_article(context, meta, title or subject_hint, body, link, "substack", 0.87, [])]
+    article = _make_article(context, meta, title or subject_hint, body, link, "substack", 0.87, [])
+    if is_paywalled:
+        article.source_link_final = False
+        if "paywall" not in article.notes:
+            article.notes.append("paywall")
+    return [article]
 
 
 def extract_mailchimp(forward_body: str, context: dict[str, Any], meta: dict[str, Any]) -> list[ParsedArticle]:

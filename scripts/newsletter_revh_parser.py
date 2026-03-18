@@ -1335,6 +1335,8 @@ def extract_substack(forward_body: str, context: dict[str, Any], meta: dict[str,
                 is_self_referential = (
                     first_norm == ref_norm
                     or (len(ref_norm) > 20 and (ref_norm in first_norm or first_norm in ref_norm))
+                    # Artefactos de formatação HTML: "AI for B oring" == "AI for Boring"
+                    or (len(ref_norm) > 20 and ref_norm.replace(" ", "") == first_norm.replace(" ", ""))
                 )
                 if not is_self_referential:
                     return real_items

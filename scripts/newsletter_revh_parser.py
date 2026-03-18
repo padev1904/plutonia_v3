@@ -1328,11 +1328,19 @@ def extract_substack(forward_body: str, context: dict[str, Any], meta: dict[str,
             real_items = [a for a in digest_articles if not _is_noise_title(a.title)]
             if len(real_items) >= 3:
                 # Se o primeiro item real é o próprio artigo (post único com cross-promo) → não é digest
+                # Usa subject_hint como base primária (mais fiável que title extraído do body)
+                # e containment para lidar com prefixos de newsletter como "[AINews]"
                 first_norm = _strip_accents(real_items[0].title.casefold()) if real_items else ""
-                subject_norm = _strip_accents((title or subject_hint or "").casefold())
-                if first_norm != subject_norm:
+                ref_norm = _strip_accents((subject_hint or title or "").casefold())
+                is_self_referential = (
+                    first_norm == ref_norm
+                    or (len(ref_norm) > 20 and (ref_norm in first_norm or first_norm in ref_norm))
+                )
+                if not is_self_referential:
                     return real_items
-    article = _make_article(context, meta, title or subject_hint, body, link, "substack", 0.87, [])
+    # subject_hint é mais fiável como título: evita que find_best_substack_title
+    # apanhe um artigo referenciado no body em vez do artigo principal
+    article = _make_article(context, meta, subject_hint or title, body, link, "substack", 0.87, [])
     if is_paywalled:
         article.source_link_final = False
         if "paywall" not in article.notes:

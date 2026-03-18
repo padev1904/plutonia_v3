@@ -108,6 +108,12 @@ def _save_email(uid: str, raw_html: str, result) -> Path:
     # raw.html
     (folder / "raw.html").write_text(raw_html, encoding="utf-8")
 
+    # Limpar pastas de artigos órfãs de runs anteriores
+    import shutil
+    for child in sorted(folder.iterdir()):
+        if child.is_dir() and child.name.startswith("article_"):
+            shutil.rmtree(child, ignore_errors=True)
+
     # articles.json + article_N/text.txt
     articles_out = []
     for idx, article in enumerate(result.articles, start=1):

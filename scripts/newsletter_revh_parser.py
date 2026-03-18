@@ -1260,6 +1260,21 @@ def find_best_substack_title(forward_body: str, context: dict[str, Any], meta: d
     return (original_subject or None), None
 
 
+_CTA_RE = re.compile(
+    r"^(?:download|click here|read more|learn more|sign up|start|try|get|subscribe|upgrade|access|view|explore|see|watch)\b",
+    re.I,
+)
+
+
+def _is_noise_title(title: str) -> bool:
+    """Devolve True se o título parece um CTA ou item de ruído (não um título real de artigo)."""
+    if not title or len(title.split()) <= 2:
+        return True
+    if _CTA_RE.match(title):
+        return True
+    return False
+
+
 def extract_substack(forward_body: str, context: dict[str, Any], meta: dict[str, Any]) -> list[ParsedArticle]:
     subject_hint = _resolved_subject_hint(context, meta)
     title, link = find_best_substack_title(forward_body, context, meta)
@@ -1288,7 +1303,10 @@ def extract_substack(forward_body: str, context: dict[str, Any], meta: dict[str,
     if not is_paywalled:
         digest_articles = _extract_link_digest_items(context, meta, "substack", max_items=6)
         if len(digest_articles) >= 3:
-            return digest_articles
+            # Verificar qualidade: pelo menos 3 items com títulos reais (não CTAs ou muito curtos)
+            real_items = [a for a in digest_articles if not _is_noise_title(a.title)]
+            if len(real_items) >= 3:
+                return digest_articles
     article = _make_article(context, meta, title or subject_hint, body, link, "substack", 0.87, [])
     if is_paywalled:
         article.source_link_final = False
@@ -1697,13 +1715,5 @@ def parse_email_articles(raw_html: str, email_meta: dict[str, Any] | None = None
         articles = extract_generic(forward_body, context, meta)
 
     cleaned_articles = [article for article in articles if article.title or article.text]
-
-    # Fix 3 — se o único artigo usa o subject como título, tenta extrair o H1/H2/H3 real do HTML
-    if len(cleaned_articles) == 1 and original_subject:
-        article = cleaned_articles[0]
-        if _strip_accents(article.title.casefold()) == _strip_accents(original_subject.casefold()):
-            heading = _extract_html_heading(raw_html, skip=original_subject)
-            if heading and not _is_section_header(heading):
-                article.title = heading
 
     return EmailParseResult(cleaned_articles, family, False, [], best_text, context.get("links", []), **_email_kwargs)

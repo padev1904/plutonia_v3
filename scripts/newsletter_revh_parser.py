@@ -654,7 +654,8 @@ def _looks_like_link_candidate_noise(
         if parsed_netloc in SOCIAL_NOISE_DOMAINS:
             return True
     if family == "substack" and _title_match_score(title, subject_hint) == 0:
-        if re.fullmatch(r"[A-Z][\w'.-]+(?: [A-Z][\w'.-]+){1,2}", clean_heading(title)):
+        # Apenas 2 palavras capitalizadas (nomes de autor), não 3+ (títulos de artigos)
+        if re.fullmatch(r"[A-Z][\w'.-]+(?: [A-Z][\w'.-]+){1}", clean_heading(title)):
             return True
     return False
 
@@ -1261,16 +1262,36 @@ def find_best_substack_title(forward_body: str, context: dict[str, Any], meta: d
 
 
 _CTA_RE = re.compile(
-    r"^(?:download|click here|read more|learn more|sign up|start|try|get|subscribe|upgrade|access|view|explore|see|watch)\b",
+    r"^(?:download|click here|read more|learn more|sign up|start|try|get|subscribe|upgrade|access|view|explore|see|watch|send|share|click|give|join|check out|find out|learn|discover)\b",
     re.I,
 )
 
+# Títulos de issues de newsletters: "TAI #195:", "HN #52:", "TDS #7:" etc.
+_NEWSLETTER_ISSUE_RE = re.compile(r"^[A-Z]{2,5}\s*#\d+\b", re.I)
+
+# Palavras que indicam cargo/função numa byline de autor
+_AUTHOR_ROLE_WORDS = frozenset([
+    "founder", "co-founder", "ceo", "cto", "coo", "editor", "director",
+    "manager", "writer", "author", "journalist", "reporter", "host",
+    "creator", "publisher", "contributor", "columnist",
+])
+
 
 def _is_noise_title(title: str) -> bool:
-    """Devolve True se o título parece um CTA ou item de ruído (não um título real de artigo)."""
+    """Devolve True se o título parece um CTA, byline ou item de ruído."""
     if not title or len(title.split()) <= 2:
         return True
     if _CTA_RE.match(title):
+        return True
+    if _NEWSLETTER_ISSUE_RE.match(title):
+        return True
+    # Byline de autor: "Louie Peters — Towards AI Co-founder and CEO"
+    if " — " in title or " – " in title:
+        low = title.lower()
+        if any(w in low for w in _AUTHOR_ROLE_WORDS):
+            return True
+    # Job listing: "AI Architect @Sedgwick (Remote/USA)"
+    if " @" in title or title.startswith("@"):
         return True
     return False
 
@@ -1301,12 +1322,16 @@ def extract_substack(forward_body: str, context: dict[str, Any], meta: dict[str,
         or "this post is for paid subscribers" in body_low
     )
     if not is_paywalled:
-        digest_articles = _extract_link_digest_items(context, meta, "substack", max_items=6)
+        digest_articles = _extract_link_digest_items(context, meta, "substack", max_items=30)
         if len(digest_articles) >= 3:
-            # Verificar qualidade: pelo menos 3 items com títulos reais (não CTAs ou muito curtos)
+            # Filtrar ruído (CTAs, bylines, job listings, issue titles)
             real_items = [a for a in digest_articles if not _is_noise_title(a.title)]
             if len(real_items) >= 3:
-                return digest_articles
+                # Se o primeiro item real é o próprio artigo (post único com cross-promo) → não é digest
+                first_norm = _strip_accents(real_items[0].title.casefold()) if real_items else ""
+                subject_norm = _strip_accents((title or subject_hint or "").casefold())
+                if first_norm != subject_norm:
+                    return real_items
     article = _make_article(context, meta, title or subject_hint, body, link, "substack", 0.87, [])
     if is_paywalled:
         article.source_link_final = False

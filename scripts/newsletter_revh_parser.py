@@ -889,6 +889,25 @@ def is_boilerplate(text: str) -> bool:
     return any(marker in hay for marker in BOILERPLATE_PATTERNS)
 
 
+_SECTION_HEADER_RE = re.compile(
+    r"^(?:part|section|chapter|step|phase|module|unit|appendix)\s+\d+",
+    re.I,
+)
+
+
+def _is_section_header(text: str) -> bool:
+    """Devolve True se o texto parece um cabeçalho de secção, não um título de artigo."""
+    if not text:
+        return True
+    if _SECTION_HEADER_RE.match(text):
+        return True
+    words = text.split()
+    # ALL CAPS com poucas palavras (ex: "PART 1: THE 101 GUIDE")
+    if len(words) <= 6 and text == text.upper() and any(c.isalpha() for c in text):
+        return True
+    return False
+
+
 def _extract_html_heading(raw_html: str, *, skip: str = "") -> str:
     """Extrai o primeiro H1/H2/H3 significativo do HTML, ignorando boilerplate.
 
@@ -1258,9 +1277,17 @@ def extract_substack(forward_body: str, context: dict[str, Any], meta: dict[str,
                 title = maybe_title
                 link = match.group("link")
                 body = body[match.end():].strip()
-    digest_articles = _extract_link_digest_items(context, meta, "substack", max_items=6)
-    if len(digest_articles) >= 3:
-        return digest_articles
+    # Não activar digest se o post é paywalled (post único com "keep reading")
+    body_low = forward_body.lower()
+    is_paywalled = (
+        "keep reading with a" in body_low
+        or "subscribe to" in body_low and "to keep reading" in body_low
+        or "this post is for paid subscribers" in body_low
+    )
+    if not is_paywalled:
+        digest_articles = _extract_link_digest_items(context, meta, "substack", max_items=6)
+        if len(digest_articles) >= 3:
+            return digest_articles
     return [_make_article(context, meta, title or subject_hint, body, link, "substack", 0.87, [])]
 
 
@@ -1670,7 +1697,7 @@ def parse_email_articles(raw_html: str, email_meta: dict[str, Any] | None = None
         article = cleaned_articles[0]
         if _strip_accents(article.title.casefold()) == _strip_accents(original_subject.casefold()):
             heading = _extract_html_heading(raw_html, skip=original_subject)
-            if heading:
+            if heading and not _is_section_header(heading):
                 article.title = heading
 
     return EmailParseResult(cleaned_articles, family, False, [], best_text, context.get("links", []), **_email_kwargs)
